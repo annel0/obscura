@@ -7091,6 +7091,63 @@ mod tests {
     }
 
     #[test]
+    fn element_style_is_not_replaced_by_a_page_expando() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d" style="color: red">hi</div></body></html>"#,
+        );
+        assert_eq!(rt.evaluate(r#"(() => {
+            const element = document.getElementById('d');
+            element._style = { color: 'poisoned' };
+            const style = element.style;
+            return [style instanceof CSSStyleDeclaration, style.color, style === element.style];
+        })()"#).unwrap(), serde_json::json!([true, "red", true]));
+    }
+
+    #[test]
+    fn first_element_style_access_ignores_replaced_page_intrinsics() {
+        let mut rt = setup_runtime("<html><body>Style</body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const element = document.body;
+            const original = [globalThis.Proxy, Object.defineProperty,
+                WeakMap.prototype.get, WeakMap.prototype.set, Reflect.apply];
+            const fail = () => { throw new Error('page intrinsic called'); };
+            let style;
+            try {
+                globalThis.Proxy = fail;
+                Object.defineProperty = fail;
+                WeakMap.prototype.get = fail;
+                WeakMap.prototype.set = fail;
+                Reflect.apply = fail;
+                style = element.style;
+            } finally {
+                [globalThis.Proxy, Object.defineProperty, WeakMap.prototype.get,
+                    WeakMap.prototype.set, Reflect.apply] = original;
+            }
+            return [style instanceof CSSStyleDeclaration, style === element.style];
+        })()"#).unwrap(), serde_json::json!([true, true]));
+    }
+
+    #[test]
+    fn element_style_first_read_observes_prior_attribute_mutations() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const element = document.createElement('div');
+            element.setAttribute('style', 'color: red');
+            element.removeAttributeNS(null, 'style');
+            element.setAttributeNS(null, 'style', 'color: blue');
+            const style = element.style;
+            const before = style.color;
+            element.style = 'color: green';
+            const assigned = style.color;
+            element.removeAttribute('style');
+            const removed = style.color;
+            style.color = 'purple';
+            return [before, assigned, removed, style === element.style,
+                element.getAttribute('style')];
+        })()"#).unwrap(), serde_json::json!(["blue", "green", "", true, "color: purple;"]));
+    }
+
+    #[test]
     fn style_attribute_parses_into_style_object() {
         // Inline styles present in the parsed HTML must be visible via el.style.*
         let mut rt = setup_runtime(
