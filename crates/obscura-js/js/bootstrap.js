@@ -7786,6 +7786,36 @@ globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
 
+// Window.name is a DOMString that starts as "" and stringifies assignments
+// (`var name = 5` leaves "5", as in browsers). It was missing, so `window.name`
+// read as undefined and string methods on it threw: Matomo's
+// `window.name.split("###")`, reached from `_paq.push(["trackPageView"])`, took
+// habr.com's whole Vue app down to its "internal error" screen. Configurable so
+// a page can still declare a top-level `let name`. Child frames start from ""
+// rather than the iframe's name attribute.
+(function () {
+  let windowName = "";
+  const get = _markNativeAs(function () { return windowName; }, "function get name() { [native code] }");
+  const set = _markNativeAs(function (value) { windowName = String(value); }, "function set name() { [native code] }");
+  Object.defineProperty(globalThis, "name", { get, set, configurable: true, enumerable: true });
+})();
+// A live browsing context is never closed.
+Object.defineProperty(globalThis, "closed", {
+  get: _markNativeAs(function () { return false; }, "function get closed() { [native code] }"),
+  configurable: true,
+  enumerable: true,
+});
+// Window.origin is [Replaceable]: it reads the document's origin until a page
+// assigns to it, and the assignment then shadows it with a plain value.
+Object.defineProperty(globalThis, "origin", {
+  get: _markNativeAs(function () { return globalThis.location.origin; }, "function get origin() { [native code] }"),
+  set: _markNativeAs(function (value) {
+    Object.defineProperty(globalThis, "origin", { value, writable: true, configurable: true, enumerable: true });
+  }, "function set origin() { [native code] }"),
+  configurable: true,
+  enumerable: true,
+});
+
 // HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
 // mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
 // event path through these: jQuery checks `("on" + ev) in window`, and React
