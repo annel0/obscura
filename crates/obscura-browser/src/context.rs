@@ -177,7 +177,7 @@ impl BrowserContext {
             proxy_url.as_deref(),
             allow_private_network,
         );
-        if stealth {
+        if stealth || block_trackers_requested() {
             client.block_trackers = true;
         }
         let profile = crate::profiles::select_profile();
@@ -249,7 +249,7 @@ impl BrowserContext {
             self.proxy_url.as_deref(),
             self.allow_private_network,
         );
-        if self.stealth {
+        if self.stealth || block_trackers_requested() {
             client.block_trackers = true;
         }
         if let Ok(mut guard) = client.user_agent.try_write() {
@@ -339,6 +339,14 @@ impl BrowserContext {
             }
         }
     }
+}
+
+
+/// OBSCURA_BLOCK_TRACKERS=1 blocks the tracker and ad hosts of the built-in
+/// list without the rest of stealth mode. A crawler wants the page's content,
+/// and those hosts are the usual source of requests that never answer.
+fn block_trackers_requested() -> bool {
+    std::env::var("OBSCURA_BLOCK_TRACKERS").is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
 }
 
 #[cfg(test)]

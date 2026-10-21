@@ -951,6 +951,7 @@ fn fetch_max_body_bytes() -> usize {
 async fn read_body_capped(
     mut response: reqwest::Response,
     max: usize,
+    stall: std::time::Duration,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
     if let Some(len) = response.content_length() {
         if len > max as u64 {
@@ -960,7 +961,6 @@ async fn read_body_capped(
         }
     }
     let mut buf: Vec<u8> = Vec::new();
-    let stall = obscura_net::read_timeout();
     loop {
         let Ok(chunk) = tokio::time::timeout(stall, response.chunk()).await else {
             return Err(deno_error::JsErrorBox::generic(format!(
@@ -985,6 +985,16 @@ async fn read_body_capped(
 /// Whether `url` is on the same site as the page `origin`, comparing hosts by
 /// their registrable domain approximated as the last two labels (three under
 /// a two-letter country code with a generic second level, like `co.uk`).
+/// `read_timeout`, capped by `third_party_timeout` for a request to another
+/// site than the page's.
+fn page_stall_timeout(url: &str, origin: &str) -> std::time::Duration {
+    let stall = obscura_net::read_timeout();
+    match obscura_net::third_party_timeout() {
+        Some(limit) if !same_site_as_page(url, origin) => stall.min(limit),
+        _ => stall,
+    }
+}
+
 fn same_site_as_page(url: &str, origin: &str) -> bool {
     let host = |value: &str| {
         url::Url::parse(value).ok().and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
@@ -4421,7 +4431,7 @@ async fn fetch_url_inner(
             // delays the load event; give up after the stall timeout like the
             // page client does. fetch()/XHR keep the whole-request timeout.
             let sent = if matches!(resource_type, ResourceType::Script | ResourceType::Stylesheet) {
-                let stall = obscura_net::read_timeout();
+                let stall = page_stall_timeout(&url, &origin);
                 match tokio::time::timeout(stall, req.send()).await {
                     Ok(sent) => sent,
                     Err(_) => {
@@ -4605,7 +4615,8 @@ async fn fetch_url_inner(
     let body = Box::pin(async move {
         let _page_in_flight = _page_in_flight;
         let mut network_guard = network_guard;
-        let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        let resp_bytes =
+            read_body_capped(response, fetch_max_body_bytes(), page_stall_timeout(&url, &origin)).await?;
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -5630,7 +5641,7 @@ mod tests {
             .send()
             .await
             .expect("request should reach the local server");
-        let err = read_body_capped(resp, 1024 * 1024)
+        let err = read_body_capped(resp, 1024 * 1024, obscura_net::read_timeout())
             .await
             .expect_err("a body larger than the cap must be rejected");
         assert!(
@@ -5647,7 +5658,7 @@ mod tests {
             .send()
             .await
             .expect("request should reach the local server");
-        let body = read_body_capped(resp, 1024 * 1024)
+        let body = read_body_capped(resp, 1024 * 1024, obscura_net::read_timeout())
             .await
             .expect("a small body must be read successfully");
         assert_eq!(body.len(), 1024, "should read the whole small body");

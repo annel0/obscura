@@ -640,6 +640,31 @@ pub fn read_timeout() -> Duration {
     Duration::from_millis(timeout_ms)
 }
 
+/// OBSCURA_THIRD_PARTY_TIMEOUT_MS: a lower stall limit for requests to
+/// another site than the page's. Unset by default, so every request gets
+/// `read_timeout`. A crawler sets it low: trackers and ad hosts that never
+/// answer (common where they are blocked) otherwise hold a page that defers
+/// their script for the whole stall limit.
+pub fn third_party_timeout() -> Option<Duration> {
+    std::env::var("OBSCURA_THIRD_PARTY_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+}
+
+/// The stall limit for a request from the document at `initiator` to
+/// `target`: `read_timeout`, capped by `third_party_timeout` across sites.
+pub fn stall_timeout(initiator: Option<&Url>, target: &Url) -> Duration {
+    capped_stall(read_timeout(), third_party_timeout(), initiator, target)
+}
+
+fn capped_stall(stall: Duration, third_party: Option<Duration>, initiator: Option<&Url>, target: &Url) -> Duration {
+    match (third_party, initiator) {
+        (Some(limit), Some(initiator)) if !crate::cookies::same_site(initiator, target) => stall.min(limit),
+        _ => stall,
+    }
+}
+
 /// DNS resolver that performs the lookup and then rejects the whole request if
 /// ANY resolved address is in the SSRF deny-set. This closes the DNS-rebinding
 /// bypass a host-string check alone cannot: a public name that resolves to
@@ -666,8 +691,16 @@ impl Resolve for SsrfGuardResolver {
         let allow = self.allow_private || env_allows_private_network();
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
-                .await
+            let started = std::time::Instant::now();
+            let looked_up = tokio::net::lookup_host((host.as_str(), 0)).await;
+            tracing::debug!(
+                target: "obscura_net::dns",
+                host = %host,
+                ms = started.elapsed().as_millis() as u64,
+                ok = looked_up.is_ok(),
+                "resolved"
+            );
+            let addrs: Vec<SocketAddr> = looked_up
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
                 .collect();
             if !allow {
@@ -861,6 +894,7 @@ async fn read_reqwest_body_limited(
     mut response: reqwest::Response,
     url: &Url,
     limit: usize,
+    stall: Duration,
 ) -> Result<Vec<u8>, ObscuraNetError> {
     reject_oversized_content_length(response.headers(), url, limit)?;
     let capacity = response
@@ -869,7 +903,6 @@ async fn read_reqwest_body_limited(
         .unwrap_or(0)
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
-    let stall = read_timeout();
     loop {
         let Ok(chunk) = tokio::time::timeout(stall, response.chunk()).await else {
             return Err(ObscuraNetError::Network(format!(
@@ -1640,6 +1673,9 @@ impl ObscuraHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
+            let stall = stall_timeout(request.initiator.as_ref(), &current_url);
+            let sent_at = std::time::Instant::now();
+            tracing::debug!(target: "obscura_net::request", url = %current_url, kind = ?request.resource_type, "send");
             // A subresource whose server never answers fails after the stall
             // timeout instead of holding the page to the whole-request one.
             // The main document keeps the full budget: a slow site is still a
@@ -1647,10 +1683,16 @@ impl ObscuraHttpClient {
             let sent = if request.resource_type == ResourceType::Document {
                 req_builder.send().await
             } else {
-                let stall = read_timeout();
                 match tokio::time::timeout(stall, req_builder.send()).await {
                     Ok(sent) => sent,
                     Err(_) => {
+                        tracing::debug!(
+                            target: "obscura_net::request",
+                            url = %current_url,
+                            kind = ?request.resource_type,
+                            ms = sent_at.elapsed().as_millis() as u64,
+                            "no response"
+                        );
                         return Err(ObscuraNetError::Network(format!(
                             "{current_url}: no response within {}ms",
                             stall.as_millis()
@@ -1658,6 +1700,14 @@ impl ObscuraHttpClient {
                     }
                 }
             };
+            tracing::debug!(
+                target: "obscura_net::request",
+                url = %current_url,
+                kind = ?request.resource_type,
+                ms = sent_at.elapsed().as_millis() as u64,
+                ok = sent.is_ok(),
+                "headers"
+            );
             let resp = sent.map_err(|e| {
                 ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
             })?;
@@ -1716,6 +1766,7 @@ impl ObscuraHttpClient {
                 resp,
                 &current_url,
                 request.max_response_bytes,
+                stall,
             )
             .await?;
             drop(in_flight);
@@ -3063,5 +3114,23 @@ mod cert_env_tests {
             None,
             Some(OsStr::new("/etc/ssl/certs"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    #[test]
+    fn third_party_stall_applies_across_sites_only() {
+        let page = Url::parse("https://vuejs.org/guide/").unwrap();
+        let own = Url::parse("https://cdn.vuejs.org/app.js").unwrap();
+        let tracker = Url::parse("https://cdn.usefathom.com/script.js").unwrap();
+        let ten = Duration::from_secs(10);
+        let three = Some(Duration::from_secs(3));
+        assert_eq!(capped_stall(ten, three, Some(&page), &tracker), Duration::from_secs(3));
+        assert_eq!(capped_stall(ten, three, Some(&page), &own), ten);
+        assert_eq!(capped_stall(ten, three, None, &tracker), ten);
+        assert_eq!(capped_stall(ten, None, Some(&page), &tracker), ten);
     }
 }
