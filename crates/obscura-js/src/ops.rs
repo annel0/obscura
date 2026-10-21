@@ -954,11 +954,18 @@ async fn read_body_capped(
         }
     }
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
-    {
+    let stall = obscura_net::read_timeout();
+    loop {
+        let Ok(chunk) = tokio::time::timeout(stall, response.chunk()).await else {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "no body data for {}ms",
+                stall.as_millis()
+            )));
+        };
+        let Some(chunk) = chunk.map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
+        else {
+            break;
+        };
         if buf.len() + chunk.len() > max {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "response body exceeds the maximum of {max} bytes"
@@ -3396,11 +3403,11 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(fetch_timeout())
-        // Fail fast on hosts that never accept the connection or go quiet
-        // after it, like the page client does (see obscura_net::connect_timeout
-        // and obscura_net::read_timeout).
+        // Fail fast on hosts that never accept the connection, like the page
+        // client does (see obscura_net::connect_timeout). Servers that go
+        // quiet are timed per request in fetch_url_inner, not here: a
+        // connection-level read timeout also kills idle pooled connections.
         .connect_timeout(obscura_net::connect_timeout())
-        .read_timeout(obscura_net::read_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
         .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
             false,
@@ -3411,6 +3418,10 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         // a navigation. Keep connections warm longer.
         .pool_idle_timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(std::time::Duration::from_secs(60));
+    // Same opt-in as the page client (see obscura_net::http2_enabled).
+    if !obscura_net::http2_enabled() {
+        builder = builder.http1_only();
+    }
     if let Some(proxy) = proxy_url {
         let p = reqwest::Proxy::all(proxy)
             .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
@@ -4353,7 +4364,24 @@ async fn fetch_url_inner(
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 PageInFlightGuard(counter.clone())
             });
-            req.send().await.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
+            // A dynamic script or stylesheet whose server never answers
+            // delays the load event; give up after the stall timeout like the
+            // page client does. fetch()/XHR keep the whole-request timeout.
+            let sent = if matches!(resource_type, ResourceType::Script | ResourceType::Stylesheet) {
+                let stall = obscura_net::read_timeout();
+                match tokio::time::timeout(stall, req.send()).await {
+                    Ok(sent) => sent,
+                    Err(_) => {
+                        return Err(deno_error::JsErrorBox::generic(format!(
+                            "{current_url}: no response within {}ms",
+                            stall.as_millis()
+                        )));
+                    }
+                }
+            } else {
+                req.send().await
+            };
+            sent.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
         };
 
         if credentials_allowed {

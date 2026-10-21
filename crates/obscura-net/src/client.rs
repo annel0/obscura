@@ -609,13 +609,29 @@ pub fn connect_timeout() -> Duration {
     Duration::from_millis(timeout_ms)
 }
 
-/// Longest silence allowed while waiting for response headers or between two
-/// reads of the body. It restarts after every read, so a slow download that
-/// keeps delivering bytes runs to the whole-request timeout, while a server
-/// that accepted the connection and then went quiet fails here. habr.com's own
+/// Whether the default (non-stealth) clients may negotiate HTTP/2. Off unless
+/// OBSCURA_HTTP2=1: with HTTP/2 on, a page reusing its context's pooled
+/// connections saw new requests to some third-party hosts (cdn.usefathom.com,
+/// media.bitterbrains.com on vuejs.org) go unanswered after the previous
+/// navigation reset its unfinished streams on the same connection. Over
+/// HTTP/1.1 the same ten-page run had every request answered, and finished
+/// faster than with a fresh context per page.
+pub fn http2_enabled() -> bool {
+    std::env::var("OBSCURA_HTTP2").is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// Longest silence allowed while waiting for a subresource's response headers
+/// or between two chunks of any response body. A slow download that keeps
+/// delivering bytes still runs to the whole-request timeout, while a server
+/// that accepted the request and then went quiet fails here: habr.com's own
 /// `/mt/t.js` intermittently never answers and held the load event for the
 /// page's full 30s script budget. OBSCURA_READ_TIMEOUT_MS overrides the 10s
 /// default.
+///
+/// It is applied per request, never as reqwest's `read_timeout`: that one
+/// times reads on the connection, so it also fires on a pooled connection that
+/// is merely idle between page loads, and on HTTP/2 it then fails every
+/// request multiplexed on that connection.
 pub fn read_timeout() -> Duration {
     let timeout_ms = std::env::var("OBSCURA_READ_TIMEOUT_MS")
         .ok()
@@ -853,9 +869,20 @@ async fn read_reqwest_body_limited(
         .unwrap_or(0)
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
-    })? {
+    let stall = read_timeout();
+    loop {
+        let Ok(chunk) = tokio::time::timeout(stall, response.chunk()).await else {
+            return Err(ObscuraNetError::Network(format!(
+                "{url}: no body data for {}ms",
+                stall.as_millis()
+            )));
+        };
+        let Some(chunk) = chunk.map_err(|error| {
+            ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
+        })?
+        else {
+            break;
+        };
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
         }
@@ -1101,7 +1128,6 @@ impl ObscuraHttpClient {
                 .redirect(Policy::none())
                 .timeout(self.timeout)
                 .connect_timeout(connect_timeout())
-                .read_timeout(read_timeout())
                 .danger_accept_invalid_certs(false)
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.
@@ -1113,6 +1139,9 @@ impl ObscuraHttpClient {
                 // so large scripts are not throttled on a high-latency path.
                 .http2_initial_stream_window_size(6 * 1024 * 1024)
                 .http2_initial_connection_window_size(15 * 1024 * 1024);
+            if !http2_enabled() {
+                builder = builder.http1_only();
+            }
 
             if std::env::var_os("SSL_CERT_FILE").is_some()
                 || std::env::var_os("SSL_CERT_DIR").is_some()
@@ -1611,7 +1640,25 @@ impl ObscuraHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = req_builder.send().await.map_err(|e| {
+            // A subresource whose server never answers fails after the stall
+            // timeout instead of holding the page to the whole-request one.
+            // The main document keeps the full budget: a slow site is still a
+            // site, not a stalled tracker.
+            let sent = if request.resource_type == ResourceType::Document {
+                req_builder.send().await
+            } else {
+                let stall = read_timeout();
+                match tokio::time::timeout(stall, req_builder.send()).await {
+                    Ok(sent) => sent,
+                    Err(_) => {
+                        return Err(ObscuraNetError::Network(format!(
+                            "{current_url}: no response within {}ms",
+                            stall.as_millis()
+                        )));
+                    }
+                }
+            };
+            let resp = sent.map_err(|e| {
                 ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
             })?;
 
