@@ -3933,6 +3933,67 @@ enum FetchOptions {
     Cancelable { cancel_rid: u32, destination: String },
 }
 
+/// A fetch()/XHR response kept by the short-lived fetch cache.
+struct CachedFetch {
+    stored: std::time::Instant,
+    status: u16,
+    url: String,
+    redirected: bool,
+    /// Headers the script may read.
+    headers: HashMap<String, String>,
+    response_headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+const FETCH_CACHE_MAX_ENTRIES: usize = 2048;
+
+/// OBSCURA_FETCH_CACHE_TTL_MS: GET fetch()/XHR responses are reused for this
+/// long by every page in the process. A crawler renders many pages of one
+/// site that load the same JSON (menus, sponsors, config); unset, nothing is
+/// cached.
+fn fetch_cache_ttl() -> Option<std::time::Duration> {
+    static TTL: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var("OBSCURA_FETCH_CACHE_TTL_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+    })
+}
+
+fn fetch_cache() -> &'static std::sync::Mutex<HashMap<String, CachedFetch>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, CachedFetch>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn fetch_cache_get(key: &str) -> Option<CachedFetch> {
+    let ttl = fetch_cache_ttl()?;
+    let cache = fetch_cache().lock().ok()?;
+    let entry = cache.get(key).filter(|entry| entry.stored.elapsed() < ttl)?;
+    Some(CachedFetch {
+        stored: entry.stored,
+        status: entry.status,
+        url: entry.url.clone(),
+        redirected: entry.redirected,
+        headers: entry.headers.clone(),
+        response_headers: entry.response_headers.clone(),
+        body: entry.body.clone(),
+    })
+}
+
+fn fetch_cache_insert(key: String, entry: CachedFetch) {
+    let Some(ttl) = fetch_cache_ttl() else { return };
+    let Ok(mut cache) = fetch_cache().lock() else { return };
+    if cache.len() >= FETCH_CACHE_MAX_ENTRIES {
+        cache.retain(|_, cached| cached.stored.elapsed() < ttl);
+        if cache.len() >= FETCH_CACHE_MAX_ENTRIES {
+            return;
+        }
+    }
+    cache.insert(key, entry);
+}
+
 async fn fetch_url_inner(
     state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String,
     body: JsBuffer, origin: String, mode: String, credentials: String,
@@ -4062,6 +4123,38 @@ async fn fetch_url_inner(
         same_site_in_flight,
         cancel: cancel.clone(),
     };
+    // A plain GET for data, not intercepted and without credentials of its
+    // own, may come from the short-lived fetch cache.
+    let fetch_cache_key = (fetch_cache_ttl().is_some()
+        && intercept_tx.is_none()
+        && method.eq_ignore_ascii_case("GET")
+        && body.is_empty()
+        && !internal_load
+        && !headers_json.to_ascii_lowercase().contains("authorization"))
+    .then(|| format!("{url}\n{origin}\n{mode}\n{credentials}\n{headers_json}"));
+    if let Some(hit) = fetch_cache_key.as_deref().and_then(fetch_cache_get) {
+        network_guard.event = None;
+        record_js_network_completion(&state, JsNetworkEvent {
+            request_id: request_id.clone(), intercepted: false,
+            error_text: None,
+            url: hit.url.clone(), method: method.clone(), status: hit.status,
+            resource_type: resource_type_name.to_string(),
+            response_headers: hit.response_headers.clone(), body_size: hit.body.len(),
+            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs_f64(),
+        }, &String::from_utf8_lossy(&hit.body), false);
+        let metadata = serde_json::json!({
+            "status": hit.status,
+            "requestId": request_id,
+            "url": hit.url,
+            "redirected": hit.redirected,
+            "opaque": false,
+            "headers": hit.headers,
+        });
+        let bytes = hit.body;
+        let body = Box::pin(async move { Ok(bytes) });
+        return fetch_body_result(&state, metadata, body, internal_load, cancel).await;
+    }
     let credentials = FetchCredentials::parse(&credentials);
 
     // Slots the interception channel can override via Continue so a consumer
@@ -4602,6 +4695,27 @@ async fn fetch_url_inner(
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
 
+    let fetch_cache_entry = fetch_cache_key
+        .filter(|_| {
+            status == 200
+                && !opaque
+                && !was_intercepted
+                && !resp_headers.contains_key("set-cookie")
+                && !resp_headers
+                    .get("cache-control")
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("no-store"))
+        })
+        .map(|key| {
+            (key, CachedFetch {
+                stored: std::time::Instant::now(),
+                status,
+                url: current_url.to_string(),
+                redirected,
+                headers: script_headers.clone(),
+                response_headers: resp_headers.clone(),
+                body: Vec::new(),
+            })
+        });
     let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
         "requestId": request_id,
@@ -4617,6 +4731,10 @@ async fn fetch_url_inner(
         let mut network_guard = network_guard;
         let resp_bytes =
             read_body_capped(response, fetch_max_body_bytes(), page_stall_timeout(&url, &origin)).await?;
+        if let Some((key, mut entry)) = fetch_cache_entry {
+            entry.body = resp_bytes.to_vec();
+            fetch_cache_insert(key, entry);
+        }
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -8188,6 +8306,8 @@ fn ensure_prepared_render_with_base_url(
         incompatible || prepared.animation_sample() != animation_sample
     }) || !state.pending_style_mutations.is_empty();
     if needs_rebuild {
+        let rebuild_started = std::time::Instant::now();
+        let retained = state.prepared_render.is_some() && !incompatible;
         if let Some(dom) = state.dom.as_ref() {
             state.animation_timeline.materialize_start_candidates(dom);
         }
@@ -8258,6 +8378,12 @@ fn ensure_prepared_render_with_base_url(
         }
         state.prepared_render = Some(prepared);
         state.resolved_scroll = None;
+        tracing::debug!(
+            target: "obscura_js::layout",
+            ms = rebuild_started.elapsed().as_micros() as f64 / 1000.0,
+            retained,
+            "render tree rebuilt"
+        );
     }
     state.prepared_render.as_ref()
 }

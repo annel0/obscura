@@ -935,7 +935,9 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
-    resource_loader: std::sync::Mutex<ResourceLoaderState>,
+    /// Subresource cache and in-flight coalescing; one per process when
+    /// `OBSCURA_RESOURCE_CACHE_SHARED` asks for it.
+    resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
@@ -945,14 +947,64 @@ pub struct ObscuraHttpClient {
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
 const RESOURCE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+fn env_flag(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// OBSCURA_RESOURCE_CACHE_SHARED=1: every client in the process shares one
+/// subresource cache, so a crawler's render threads download a site's
+/// scripts and styles once instead of once per thread and page.
+fn resource_loader_for_new_client() -> Arc<std::sync::Mutex<ResourceLoaderState>> {
+    static SHARED: OnceLock<Arc<std::sync::Mutex<ResourceLoaderState>>> = OnceLock::new();
+    if env_flag("OBSCURA_RESOURCE_CACHE_SHARED") {
+        SHARED.get_or_init(Default::default).clone()
+    } else {
+        Default::default()
+    }
+}
+
+/// (entries, bytes) the cache holds: OBSCURA_RESOURCE_CACHE_MB sets the
+/// size, 64 MB and 256 entries by default; entries scale with the size.
+fn resource_cache_limits() -> (usize, usize) {
+    static LIMITS: OnceLock<(usize, usize)> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        match std::env::var("OBSCURA_RESOURCE_CACHE_MB").ok().and_then(|value| value.trim().parse::<usize>().ok()) {
+            Some(megabytes) if megabytes > 0 => {
+                let bytes = megabytes * 1024 * 1024;
+                (RESOURCE_CACHE_MAX_ENTRIES.max(megabytes * 16), bytes)
+            }
+            _ => (RESOURCE_CACHE_MAX_ENTRIES, RESOURCE_CACHE_MAX_BYTES),
+        }
+    })
+}
+
+/// OBSCURA_RESOURCE_CACHE_MIN_TTL_MS: keep scripts, stylesheets and fonts
+/// that do not say how long they stay fresh (no `max-age`, or `no-cache`)
+/// for this long anyway. `no-store` is still honoured. For a crawl that
+/// takes a snapshot of a site, re-downloading the same bundle for every
+/// page is the cost of a cache a browser would revalidate.
+fn resource_cache_min_ttl() -> Option<Duration> {
+    static MIN_TTL: OnceLock<Option<Duration>> = OnceLock::new();
+    *MIN_TTL.get_or_init(|| {
+        std::env::var("OBSCURA_RESOURCE_CACHE_MIN_TTL_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ResourceCacheKey {
     url: String,
     resource_type: ResourceType,
     mode: RequestMode,
     credentials: RequestCredentials,
+    /// The initiator's origin, not its URL: CORS and credentials depend on
+    /// the origin, and keying by page URL made every page of a site miss
+    /// the cache for the bundle all of them load. The referrer is left out
+    /// for the same reason, as browsers do.
     initiator: Option<String>,
-    referrer: Option<String>,
     user_agent: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
@@ -1023,17 +1075,16 @@ impl ResourceCache {
     }
 
     fn insert(&mut self, key: ResourceCacheKey, response: Response, lifetime: Duration) {
+        let (max_entries, max_bytes) = resource_cache_limits();
         let response_bytes = response.body.len();
-        if response_bytes > RESOURCE_CACHE_MAX_BYTES {
+        if response_bytes > max_bytes {
             return;
         }
         if let Some(previous) = self.entries.remove(&key) {
             self.body_bytes = self.body_bytes.saturating_sub(previous.response.body.len());
             self.insertion_order.retain(|queued| queued != &key);
         }
-        while self.entries.len() >= RESOURCE_CACHE_MAX_ENTRIES
-            || self.body_bytes.saturating_add(response_bytes) > RESOURCE_CACHE_MAX_BYTES
-        {
+        while self.entries.len() >= max_entries || self.body_bytes.saturating_add(response_bytes) > max_bytes {
             let Some(oldest) = self.insertion_order.pop_front() else {
                 break;
             };
@@ -1051,6 +1102,22 @@ impl ResourceCache {
             },
         );
     }
+}
+
+/// Whether `resource_cache_min_ttl` may keep a response that
+/// `response_cache_lifetime` does not: a static subresource the server did
+/// not forbid storing.
+fn min_ttl_applies(resource_type: ResourceType, response: &Response) -> bool {
+    matches!(resource_type, ResourceType::Script | ResourceType::Stylesheet | ResourceType::Font)
+        && (200..300).contains(&response.status)
+        && response.redirected_from.is_empty()
+        && response.header("set-cookie").is_none()
+        && !response
+            .header("vary")
+            .is_some_and(|vary| vary.split(',').any(|name| name.trim() == "*"))
+        && !response
+            .header("cache-control")
+            .is_some_and(|value| value.split(',').any(|directive| directive.trim().eq_ignore_ascii_case("no-store")))
 }
 
 fn response_cache_lifetime(response: &Response) -> Option<Duration> {
@@ -1150,7 +1217,7 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
-            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
+            resource_loader: resource_loader_for_new_client(),
             allow_private_network,
         }
     }
@@ -1304,7 +1371,12 @@ impl ObscuraHttpClient {
         }) {
             return None;
         }
-        if request.sends_credentials_to(url)
+        // A crawl that keeps static subresources anyway (min TTL) keeps them
+        // whatever cookies ride along: bundles do not vary by session.
+        let static_for_crawl = resource_cache_min_ttl().is_some()
+            && matches!(request.resource_type, ResourceType::Script | ResourceType::Stylesheet | ResourceType::Font);
+        if !static_for_crawl
+            && request.sends_credentials_to(url)
             && !self
                 .cookie_jar
                 .get_cookie_header_in_context(url, SameSiteContext::SameSite)
@@ -1317,8 +1389,7 @@ impl ObscuraHttpClient {
             resource_type: request.resource_type,
             mode: request.mode,
             credentials: request.credentials,
-            initiator: request.initiator.as_ref().map(ToString::to_string),
-            referrer: request.referrer.as_ref().map(ToString::to_string),
+            initiator: request.initiator.as_ref().map(|initiator| initiator.origin().ascii_serialization()),
             user_agent: self.user_agent.read().await.clone(),
             extra_headers,
             max_response_bytes: request.max_response_bytes,
@@ -1417,6 +1488,7 @@ impl ObscuraHttpClient {
                     sender,
                     finished: false,
                 };
+                let request_type = request.resource_type;
                 let result = self
                     .fetch_with_profile_uncached(
                         initial_method,
@@ -1427,7 +1499,9 @@ impl ObscuraHttpClient {
                     )
                     .await;
                 let shared_outcome = match &result {
-                    Ok(response) => match response_cache_lifetime(response) {
+                    Ok(response) => match response_cache_lifetime(response).or_else(|| {
+                        resource_cache_min_ttl().filter(|_| min_ttl_applies(request_type, response))
+                    }) {
                         Some(lifetime) => {
                             self.resource_loader.lock().unwrap().cache.insert(
                                 cache_key,
@@ -1869,7 +1943,6 @@ mod resource_cache_tests {
             mode: RequestMode::NoCors,
             credentials: RequestCredentials::Omit,
             initiator: None,
-            referrer: None,
             user_agent: "cache-test".into(),
             extra_headers: Vec::new(),
             max_response_bytes: 1024,
@@ -2828,6 +2901,25 @@ mod ssrf_tests {
 
         assert_eq!(responses.len(), 16);
         assert!(responses.iter().all(|response| response.status == 200));
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pages_of_one_origin_share_cached_subresources() {
+        // The cache is keyed by the initiator's origin: every page of a site
+        // reuses its bundle instead of downloading it again.
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Cache-Control: public, max-age=3600\r\n",
+        )
+        .await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        for page in ["/a", "/b?x=1", "/c/d"] {
+            let initiator = url.join(page).unwrap();
+            let request = ResourceRequest::module_script(&initiator, &initiator);
+            let response = client.fetch_resource_with_callbacks(&url, request, None).await.unwrap();
+            assert_eq!(response.status, 200);
+        }
         assert_eq!(network_requests.load(Ordering::SeqCst), 1);
     }
 
