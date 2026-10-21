@@ -1287,6 +1287,7 @@ async fn cdp_processor(
                     dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
                     dispatch::drain_frame_events(&mut ctx);
+                    crate::domains::page::emit_deferred_load_events(&mut ctx);
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
                     if let (Some(reply_tx), Some((session_id, url, method, body))) = (
                         connection_reply_tx.as_ref(),
