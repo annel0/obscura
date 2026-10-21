@@ -395,6 +395,21 @@ struct ScriptPrefetch {
     finished: std::collections::HashSet<usize>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Lets a test shorten the script deadline for its own thread instead of
+    /// setting OBSCURA_SCRIPT_DEADLINE_MS for every test in the process.
+    static SCRIPT_DEADLINE_FOR_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn script_deadline_override() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(ms) = SCRIPT_DEADLINE_FOR_TEST.with(std::cell::Cell::get) {
+        return Some(ms);
+    }
+    None
+}
+
 /// When `Page::settle_content` considers a page's content settled.
 #[derive(Debug, Clone, Copy)]
 pub struct SettlePolicy {
@@ -2339,29 +2354,65 @@ impl Page {
     /// The fetched body of script `index`, waiting only for that script's own
     /// download. Other downloads keep running while this one is awaited, and
     /// their results are parked in `pending.ready` for later scripts.
+    ///
+    /// With `drive_event_loop` (a deferred script, after parsing) the page's
+    /// event loop runs meanwhile, as a browser spins it while it waits:
+    /// timers fire, fetches and dynamic imports complete. Without it a slow
+    /// deferred script (a tracker) froze the page's own lazy chunks until it
+    /// arrived or timed out.
     async fn script_body(
         &mut self,
         pending: &mut ScriptPrefetch,
         index: usize,
         deadline: tokio::time::Instant,
+        drive_event_loop: bool,
     ) -> Option<(String, String, obscura_net::Response)> {
+        enum Woke {
+            Fetched(Option<Result<(usize, Option<(String, obscura_net::Response)>), tokio::task::JoinError>>),
+            Deadline,
+            EventLoop,
+        }
         if !pending.planned.contains(&index) {
             return None;
         }
         while !pending.finished.contains(&index) {
-            let joined = match tokio::time::timeout_at(deadline, pending.fetches.join_next()).await
-            {
-                Ok(Some(joined)) => joined,
-                Ok(None) => break,
-                Err(_) => {
+            let woke = {
+                let js = self.js.as_mut();
+                let drive = drive_event_loop && js.is_some();
+                tokio::select! {
+                    joined = tokio::time::timeout_at(deadline, pending.fetches.join_next()) => match joined {
+                        Ok(joined) => Woke::Fetched(joined),
+                        Err(_) => Woke::Deadline,
+                    },
+                    () = async {
+                        match js {
+                            Some(js) => {
+                                // A turn that finds nothing ready returns at
+                                // once; queued timers do not keep deno's loop
+                                // busy, so look again shortly rather than stop.
+                                if matches!(js.run_autonomous_event_loop_turn().await, Ok(true)) {
+                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                }
+                            }
+                            None => std::future::pending().await,
+                        }
+                    }, if drive => Woke::EventLoop,
+                }
+            };
+            match woke {
+                Woke::Fetched(Some(joined)) => {
+                    if let Ok(done) = joined {
+                        self.absorb_script_fetch(pending, done);
+                    }
+                }
+                Woke::Fetched(None) => break,
+                Woke::Deadline => {
                     tracing::warn!(
                         "execute_scripts: fetch deadline reached, some scripts may not have loaded"
                     );
                     return None;
                 }
-            };
-            if let Ok(done) = joined {
-                self.absorb_script_fetch(pending, done);
+                Woke::EventLoop => {}
             }
         }
         pending.ready.remove(&index)
@@ -2881,10 +2932,12 @@ impl Page {
         // synchronous hang. Raise it further with OBSCURA_SCRIPT_DEADLINE_MS=<ms>
         // for very heavy SPAs on slow networks (pair it with a matching client
         // navigation timeout).
-        let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30_000);
+        let script_deadline_ms: u64 = script_deadline_override().unwrap_or_else(|| {
+            std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000)
+        });
         let script_deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
 
@@ -3085,7 +3138,9 @@ impl Page {
                         // parser-blocking scripts behind it.
                         late_async.push(index);
                     } else {
-                        let fetched_script = self.script_body(&mut pending, index, script_deadline).await;
+                        // Parser-blocking: the parser (and so the event loop
+                        // that would see later markup) waits.
+                        let fetched_script = self.script_body(&mut pending, index, script_deadline, false).await;
                         execute_classic(self, script, fetched_script);
                         if let Some(js) = &mut self.js {
                             if js.take_document_write_inserted_script()
@@ -3259,7 +3314,7 @@ impl Page {
             match scheduled {
                 ScheduledScript::Classic(index) => {
                     let script = &all_scripts[index];
-                    let fetched_script = self.script_body(&mut pending, index, script_deadline).await;
+                    let fetched_script = self.script_body(&mut pending, index, script_deadline, true).await;
                     execute_classic(self, script, fetched_script);
                     if let Some(js) = &mut self.js {
                         if js.take_document_write_inserted_script()
@@ -8408,6 +8463,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn timers_run_while_a_deferred_script_downloads() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let body = "globalThis.__seenAtDeferred = document.body.dataset.timer || 'missing';";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut page = import_map_test_page(
+            "deferred-drives-event-loop",
+            &base,
+            r#"<html><head>
+                <script>setTimeout(() => { document.body.dataset.timer = "fired"; }, 50);</script>
+                <script defer src="./slow.js"></script>
+            </head><body></body></html>"#,
+        );
+        page.execute_scripts().await;
+
+        // A browser keeps running tasks while a deferred script downloads.
+        let seen = page.js.as_mut().unwrap().evaluate("globalThis.__seenAtDeferred").unwrap();
+        assert_eq!(seen, serde_json::json!("fired"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn module_graph_and_evaluation_share_one_active_budget() {
         use std::io::{Read as _, Write as _};
 
@@ -8832,7 +8922,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn navigation_timing_terminated_handlers_do_not_record_completion() {
-        std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "250");
+        // A thread-local deadline: setting OBSCURA_SCRIPT_DEADLINE_MS here
+        // shortened it for every test running alongside, and failed those
+        // with slower deferred scripts.
+        super::SCRIPT_DEADLINE_FOR_TEST.with(|deadline| deadline.set(Some(250)));
         let mut page = import_map_test_page(
             "terminated-navigation-timing", "http://127.0.0.1:9", "<html><body></body></html>",
         );
