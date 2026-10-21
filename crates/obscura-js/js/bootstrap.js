@@ -5004,10 +5004,11 @@ class Element extends Node {
   set placeholder(v) { this.setAttribute("placeholder", v); }
   get accept() { return this.getAttribute("accept") || ""; }
   set accept(v) { this.setAttribute("accept", v); }
-  // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
-  // and what scrapers want). It uses op_url_resolve, which returns just the
-  // resolved string, rather than the full-component op the decomposition
-  // members use. Other elements reflect the raw attribute.
+  // For <a>/<area>/<link>, href returns the resolved absolute URL (the spec
+  // behavior, and what scrapers want: `link[rel=canonical].href` and hreflang
+  // alternates used to come back relative). It uses op_url_resolve, which
+  // returns just the resolved string, rather than the full-component op the
+  // decomposition members use. Other elements reflect the raw attribute.
   get href() {
     const ln = this.localName;
     // SVG href-bearing elements reflect href as an SVGAnimatedString (with the
@@ -5020,7 +5021,7 @@ class Element extends Node {
       if (!this._svgHref) this._svgHref = new SVGAnimatedString(this, "href", "xlink:href");
       return this._svgHref;
     }
-    if (ln === 'a' || ln === 'area') {
+    if (ln === 'a' || ln === 'area' || ln === 'link') {
       const raw = this.getAttribute('href');
       if (raw === null) return '';
       // Legacy-charset document: href must reflect the encoding-override query.
