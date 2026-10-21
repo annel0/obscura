@@ -2319,6 +2319,17 @@ impl ObscuraJsRuntime {
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
                 let load = async move {
+                    // A crawler skips what only pixels need: the load fails
+                    // at once, as an unreachable URL does, and is not retried.
+                    if skip_render_resource(is_font) {
+                        return crate::ops::RenderResourceLoad {
+                            generation,
+                            url: raw,
+                            profile,
+                            is_font,
+                            response: None,
+                        };
+                    }
                     // Every load of this page waits for the same permits, so
                     // repeated scans cannot multiply the request rate.
                     let _permit = limiter.acquire_owned().await.ok();
@@ -4597,6 +4608,18 @@ impl Default for ObscuraJsRuntime {
     fn default() -> Self {
         Self::new()
     }
+}
+
+
+/// OBSCURA_RENDER_SKIP_IMAGES=1 / OBSCURA_RENDER_SKIP_FONTS=1: layout does
+/// not download images or web fonts. A crawler reading the DOM needs
+/// neither, and they were the connections most renders opened.
+#[cfg(feature = "render")]
+fn skip_render_resource(is_font: bool) -> bool {
+    static SKIP: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let flag = |key: &str| std::env::var(key).is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"));
+    let (images, fonts) = *SKIP.get_or_init(|| (flag("OBSCURA_RENDER_SKIP_IMAGES"), flag("OBSCURA_RENDER_SKIP_FONTS")));
+    if is_font { fonts } else { images }
 }
 
 #[cfg(test)]
