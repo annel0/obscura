@@ -34,31 +34,41 @@ fn configured_root_paths() -> Vec<std::path::PathBuf> {
     paths
 }
 
+fn load_configured_root_certificates() -> Vec<reqwest::Certificate> {
+    let mut certificates = Vec::new();
+    for path in configured_root_paths() {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "failed to read CA certificate file");
+                continue;
+            }
+        };
+        match reqwest::Certificate::from_pem_bundle(&bytes) {
+            Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
+            _ => match reqwest::Certificate::from_der(&bytes) {
+                Ok(certificate) => certificates.push(certificate),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
+                }
+            },
+        }
+    }
+    certificates
+}
+
+#[cfg(not(test))]
 fn configured_root_certificates() -> &'static [reqwest::Certificate] {
     static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+    ROOTS.get_or_init(load_configured_root_certificates)
+}
 
-    ROOTS.get_or_init(|| {
-        let mut certificates = Vec::new();
-        for path in configured_root_paths() {
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "failed to read CA certificate file");
-                    continue;
-                }
-            };
-            match reqwest::Certificate::from_pem_bundle(&bytes) {
-                Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
-                _ => match reqwest::Certificate::from_der(&bytes) {
-                    Ok(certificate) => certificates.push(certificate),
-                    Err(error) => {
-                        tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
-                    }
-                },
-            }
-        }
-        certificates
-    })
+/// Read afresh for each client in tests: tests that each point SSL_CERT_FILE
+/// or SSL_CERT_DIR at their own CA share one process, and a cached set
+/// trusted only the first test's CA.
+#[cfg(test)]
+fn configured_root_certificates() -> &'static [reqwest::Certificate] {
+    Box::leak(load_configured_root_certificates().into_boxed_slice())
 }
 
 /// Whether SSL_CERT_FILE / SSL_CERT_DIR request a custom TLS trust store. A
