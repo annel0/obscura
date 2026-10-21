@@ -3578,6 +3578,13 @@ impl ObscuraJsRuntime {
             > 0
     }
 
+    /// Whether an `import()` is loading, or finished a moment ago and its
+    /// module graph may still be on its way to the next dependency.
+    pub fn has_pending_dynamic_imports(&self) -> bool {
+        self.module_load_activity
+            .is_pending_or_recent(std::time::Duration::from_millis(100))
+    }
+
     /// Whether a request the page started to its own site is still in flight.
     pub fn has_pending_same_site_requests(&self) -> bool {
         self.state

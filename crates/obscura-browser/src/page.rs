@@ -2875,8 +2875,10 @@ impl Page {
                 quiet_since = now;
             }
             // Once `load` has fired the page considers itself loaded, so only
-            // its own data requests still hold the wait.
+            // its own data requests and lazy code still hold the wait: a
+            // route's chunk still loading renders the content when it lands.
             let network = js.has_pending_same_site_requests()
+                || js.has_pending_dynamic_imports()
                 || (!load_fired
                     && now < grace_until
                     && (js.has_pending_network_requests() || js.has_pending_dynamic_scripts()));
@@ -9477,6 +9479,47 @@ mod tests {
                 .unwrap(),
             serde_json::json!("lazy-ready"),
             "an explicit caller settle must drive the lazy module graph",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_settle_waits_for_a_route_chunk_after_load() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            // Longer than the quiet that settles a loaded page.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let body = "export const members = 'team';";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut page = import_map_test_page(
+            "route-chunk-settle",
+            &base,
+            r#"<html><body><main></main><script>
+                import("./team.js").then(module => {
+                    document.querySelector("main").textContent = module.members;
+                });
+            </script></body></html>"#,
+        );
+        page.execute_scripts().await;
+        let settle = page.settle_content(super::SettlePolicy::default()).await;
+
+        assert!(settle.settled);
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("document.querySelector('main').textContent").unwrap(),
+            serde_json::json!("team"),
+            "the snapshot was taken before the route's chunk rendered",
         );
     }
 
