@@ -23503,6 +23503,40 @@ mod tests {
     }
 
     #[test]
+    fn text_decoder_replaces_malformed_utf8_and_preserves_bom_options() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const cases = [
+                [[0x80], '\ufffd'],
+                [[0xc0, 0xaf], '\ufffd\ufffd'],
+                [[0xe0, 0x80, 0xaf], '\ufffd\ufffd\ufffd'],
+                [[0xed, 0xa0, 0x80], '\ufffd\ufffd\ufffd'],
+                [[0xf4, 0x90, 0x80, 0x80], '\ufffd\ufffd\ufffd\ufffd'],
+                [[0xf5, 0x80, 0x80, 0x80], '\ufffd\ufffd\ufffd\ufffd'],
+                [[0xe2, 0x82], '\ufffd'],
+                [[0xf0, 0x9f, 0x92], '\ufffd'],
+                [[0xc2, 0x41], '\ufffdA'],
+                [[0xe2, 0x28, 0xa1], '\ufffd(\ufffd'],
+            ];
+            for (const [bytes, expected] of cases) {
+                const buffer = new Uint8Array([99, ...bytes, 99]);
+                const view = new DataView(buffer.buffer, 1, bytes.length);
+                const actual = new TextDecoder().decode(view);
+                if (actual !== expected) return {bytes, actual, expected};
+                try { new TextDecoder('utf-8', {fatal:true}).decode(view); return 'fatal accepted'; }
+                catch (error) { if (!(error instanceof TypeError)) return error.name; }
+            }
+            const bytes = new Uint8Array([0xef,0xbb,0xbf,65,0,34,92,10,0xc3,0xa9,0xf0,0x9f,0x98,0x80]);
+            const expected = 'A\0"\\\n\u00e9\ud83d\ude00';
+            const decoder = new TextDecoder('utf8', {fatal:true});
+            return [new TextDecoder().decode(bytes) === expected,
+                new TextDecoder('utf8', {ignoreBOM:true}).decode(bytes) === '\ufeff' + expected,
+                decoder.decode(bytes) === expected, decoder.decode(new Uint8Array()) === ''];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, true, true, true]));
+    }
+
+    #[test]
     fn test_document_doctype() {
         let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
         let result = rt.evaluate("document.doctype !== null").unwrap();
