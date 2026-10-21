@@ -9108,6 +9108,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn window_named_access_uses_native_attributes_not_page_overrides() {
+        let mut rt = setup_runtime("<html><body><div id='nativeName'></div></body></html>");
+        let result = rt.evaluate(r#"
+            const element = document.getElementById('nativeName');
+            let calls = 0;
+            element.getAttribute = () => { calls++; return null; };
+            const documentQuery = document.querySelectorAll;
+            document.querySelectorAll = function(selector) {
+                if (selector.includes('[id]')) { calls++; return []; }
+                return documentQuery.call(this,selector);
+            };
+            const existing = window.nativeName === element;
+            const subtree = document.createElement('section');
+            subtree.innerHTML = '<span id="insertedName"></span><img name="insertedImage">';
+            const span = subtree.firstElementChild;
+            const image = subtree.lastElementChild;
+            const elementQuery = subtree.querySelectorAll;
+            subtree.querySelectorAll = function(selector) {
+                if (selector.includes('[id]')) { calls++; return []; }
+                return elementQuery.call(this,selector);
+            };
+            span.getAttribute = image.getAttribute = () => { calls++; return null; };
+            document.body.appendChild(subtree);
+            const inserted = window.insertedName === span && window.insertedImage === image;
+            subtree.remove();
+            return [existing, inserted, 'insertedName' in window, 'insertedImage' in window, calls];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([true,true,false,false,0]));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn inserting_a_frame_before_itself_retires_its_old_document_without_reordering() {
         let mut rt = setup_runtime("<html><body><b id='before'></b><iframe id='frame'></iframe><b id='after'></b></body></html>");

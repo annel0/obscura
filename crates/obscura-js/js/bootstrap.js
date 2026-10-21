@@ -14520,48 +14520,23 @@ function _windowNameEligibleElement(element) {
     && _windowNamedNameTags.has(element.localName);
 }
 
-function _windowNamedSupportedNames(element) {
-  const names = [];
-  if (!element || element.nodeType !== 1) return names;
-  const id = element.getAttribute("id");
-  if (id) names.push(id);
-  if (_windowNameEligibleElement(element)) {
-    const name = element.getAttribute("name");
-    if (name && name !== id) names.push(name);
-  }
-  return names;
-}
-
 function _windowNamedCandidates(name) {
   const doc = globalThis.document;
   if (!doc || !name) return [];
-  const elements = doc.querySelectorAll(
-    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
-  );
-  const matches = [];
-  for (let i = 0; i < elements.length; i++) {
-    const element = elements[i];
-    if (element.getAttribute("id") === name
-        || (_windowNameEligibleElement(element)
-          && element.getAttribute("name") === name)) {
-      matches.push(element);
-    }
-  }
-  return matches;
+  return _domParse("window_named_candidates", name) || [];
 }
 
 function _windowNamedValue(name) {
   const matches = _windowNamedCandidates(name);
   if (matches.length === 0) return undefined;
-  for (const element of matches) {
-    if (element.localName === "iframe" && _windowNameEligibleElement(element)
-        && element.getAttribute("name") === name) {
-      const window = element.contentWindow;
+  for (const [nid, namedFrame] of matches) {
+    if (namedFrame) {
+      const window = _wrapEl(nid).contentWindow;
       if (window) return window;
     }
   }
-  if (matches.length > 1) return HTMLCollection._from(matches);
-  return matches[0];
+  if (matches.length > 1) return HTMLCollection._from(matches.map(([nid]) => _wrapEl(nid)));
+  return _wrapEl(matches[0][0]);
 }
 
 function _ensureWindowNamedProperty(name) {
@@ -14599,20 +14574,7 @@ function _reconcileWindowNamedProperty(name) {
 }
 
 function _windowNamedNamesInTree(root) {
-  const names = new Set();
-  if (!root) return names;
-  if (root.nodeType === 1) {
-    for (const name of _windowNamedSupportedNames(root)) names.add(name);
-  }
-  if (typeof root.querySelectorAll === "function") {
-    const elements = root.querySelectorAll(
-      "[id],embed[name],form[name],iframe[name],img[name],object[name]"
-    );
-    for (let i = 0; i < elements.length; i++) {
-      for (const name of _windowNamedSupportedNames(elements[i])) names.add(name);
-    }
-  }
-  return names;
+  return new Set(root ? _domParse("window_named_names", root._nid) || [] : []);
 }
 
 function _registerWindowNamedTree(root) {
@@ -14629,15 +14591,7 @@ function _reconcileWindowNamedProperties(names) {
   if (!names || names.size === 0) return;
   const doc = globalThis.document;
   if (!doc) return;
-  const present = new Set();
-  const elements = doc.querySelectorAll(
-    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
-  );
-  for (let i = 0; i < elements.length; i++) {
-    for (const name of _windowNamedSupportedNames(elements[i])) {
-      if (names.has(name)) present.add(name);
-    }
-  }
+  const present = _windowNamedNamesInTree(doc);
   for (const name of names) {
     if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
       try { delete globalThis[name]; } catch (_error) {}
