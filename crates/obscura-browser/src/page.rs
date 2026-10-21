@@ -2803,7 +2803,7 @@ impl Page {
                         // An async script runs when its download finishes, not
                         // in document order, so a slow one must not hold up the
                         // parser-blocking scripts behind it.
-                        late_async.push(ScheduledScript::Classic(index));
+                        late_async.push(index);
                     } else {
                         let fetched_script = self.script_body(&mut pending, index, script_deadline).await;
                         execute_classic(self, script, fetched_script);
@@ -2960,8 +2960,6 @@ impl Page {
             }
         }
 
-        post_parse.extend(late_async);
-
         // Parsing has finished before defer scripts and non-async modules run.
         // They still gate DOMContentLoaded, but observe the browser's
         // `interactive` readyState while they execute.
@@ -3053,7 +3051,41 @@ impl Page {
             if completed.is_ok() {
                 js.record_navigation_timing("domContentLoadedEventEnd");
             }
+        }
 
+        // Async scripts that had not arrived when the parser reached them run
+        // as their downloads finish, in arrival order. Like dynamic scripts
+        // they delay the load event but not DOMContentLoaded, so a stalled
+        // third-party script (an ad host that drops packets, analytics that
+        // never answers) no longer holds back the defer and module scripts or
+        // the DOMContentLoaded listeners.
+        while !late_async.is_empty() {
+            while let Some(Ok(done)) = pending.fetches.try_join_next() {
+                self.absorb_script_fetch(&mut pending, done);
+            }
+            if let Some(position) =
+                late_async.iter().position(|index| pending.finished.contains(index))
+            {
+                let index = late_async.remove(position);
+                let fetched_script = pending.ready.remove(&index);
+                execute_classic(self, &all_scripts[index], fetched_script);
+                continue;
+            }
+            match tokio::time::timeout_at(script_deadline, pending.fetches.join_next()).await {
+                Ok(Some(Ok(done))) => self.absorb_script_fetch(&mut pending, done),
+                Ok(Some(Err(_))) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        "execute_scripts: deadline reached with {} async scripts still loading",
+                        late_async.len()
+                    );
+                    break;
+                }
+            }
+        }
+
+        if let Some(js) = &mut self.js {
             let load_blockers_finished =
                 Self::drive_load_delaying_scripts(js, script_deadline).await;
             if !load_blockers_finished {
