@@ -2824,6 +2824,24 @@ impl ObscuraJsRuntime {
     }
 
     #[doc(hidden)]
+    pub fn has_cdp_evaluation(&self, pending: &PendingCdpEvaluation) -> bool {
+        self.pending_cdp_evaluations.contains_key(&pending.object_id)
+    }
+
+    fn has_ready_cdp_evaluations(&mut self) -> bool {
+        if self.pending_cdp_evaluations.is_empty() { return false; }
+        let records: Vec<_> = self.pending_cdp_evaluations.values().cloned().collect();
+        let mut entered = self.runtime();
+        let context = entered.main_context();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
+        let Some(key) = v8::String::new(scope, "done") else { return false; };
+        records.into_iter().any(|record| {
+            let Ok(record) = v8::Local::<v8::Object>::try_from(v8::Local::new(scope, record)) else { return false; };
+            record.get(scope, key.into()).is_some_and(|value| value.is_true())
+        })
+    }
+
+    #[doc(hidden)]
     pub fn cdp_evaluation_ready(&mut self, pending: &PendingCdpEvaluation) -> bool {
         let Some(record) = self.pending_cdp_evaluations.get(&pending.object_id).cloned() else {
             return false;
@@ -3772,6 +3790,9 @@ impl ObscuraJsRuntime {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
         }
 
+        // Publish settled protocol replies before parking on unrelated page work.
+        if self.has_ready_cdp_evaluations() { return Ok(false); }
+
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
@@ -3789,6 +3810,9 @@ impl ObscuraJsRuntime {
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
                 ));
+            }
+            if self.has_ready_cdp_evaluations() {
+                return std::task::Poll::Ready(Ok(false));
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
