@@ -15923,6 +15923,19 @@ class _Canvas2D {
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
     const str = String(text);
+    // The glyph box is 7*scale tall with its bottom on y, i.e. drawn for the
+    // default 'alphabetic' baseline. Shift it for the others: with 'top', text
+    // drawn at y=0 used to land entirely above the canvas, so the canvas stayed
+    // blank. axe-core draws exactly that to tell icon ligatures from text, saw
+    // nothing, treated every text node as an icon and skipped color-contrast.
+    const baseline = this.textBaseline;
+    if (baseline === 'top' || baseline === 'hanging') y += 7 * scale;
+    else if (baseline === 'middle') y += Math.round(3.5 * scale);
+    else if (baseline === 'bottom' || baseline === 'ideographic') y -= 2 * scale;
+    // Same for textAlign, using the advance measureText reports (left-to-right).
+    const width = str.length * 6 * scale;
+    if (this.textAlign === 'center') x -= width / 2;
+    else if (this.textAlign === 'right' || this.textAlign === 'end') x -= width;
     let cx = Math.round(x);
     for (let i = 0; i < str.length; i++) {
       const code = str.charCodeAt(i);
