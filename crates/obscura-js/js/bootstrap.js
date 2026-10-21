@@ -130,7 +130,9 @@ Object.defineProperty(globalThis, "__obscura_binding_called", {
 globalThis.__obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
-globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.preventDefault(); };
+// No default onunhandledrejection: it used to cancel every rejection, which hid
+// them from CDP clients and left `window.onunhandledrejection` a function where
+// browsers have null (the GlobalEventHandlers loop below sets it).
 
 globalThis.onerror = function(msg, src, line, col, error) {
   globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
@@ -11860,7 +11862,14 @@ __obscuraCore.setUnhandledPromiseRejectionHandler((promise, reason) => {
     reason,
     cancelable: true,
   });
-  globalThis.dispatchEvent(event);
+  // A rejection no handler cancels is reported the way Chrome reports it: as
+  // Runtime.exceptionThrown for CDP clients plus an "Uncaught (in promise)"
+  // console error. Before, it only reached page listeners, so crawlers never
+  // saw rejections that broke a page.
+  if (_eventTargetDispatch(globalThis, event)) {
+    __obscuraCore.ops.op_report_browser_exception(reason, globalThis.__obscura_frameId || 0);
+    _consoleFn("error", ["Uncaught (in promise)", reason]);
+  }
   // Browsers report an unhandled rejection without terminating the page's
   // event loop. Returning true tells deno_core that the host delivered it.
   return true;
