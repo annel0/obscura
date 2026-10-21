@@ -609,6 +609,21 @@ pub fn connect_timeout() -> Duration {
     Duration::from_millis(timeout_ms)
 }
 
+/// Longest silence allowed while waiting for response headers or between two
+/// reads of the body. It restarts after every read, so a slow download that
+/// keeps delivering bytes runs to the whole-request timeout, while a server
+/// that accepted the connection and then went quiet fails here. habr.com's own
+/// `/mt/t.js` intermittently never answers and held the load event for the
+/// page's full 30s script budget. OBSCURA_READ_TIMEOUT_MS overrides the 10s
+/// default.
+pub fn read_timeout() -> Duration {
+    let timeout_ms = std::env::var("OBSCURA_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000);
+    Duration::from_millis(timeout_ms)
+}
+
 /// DNS resolver that performs the lookup and then rejects the whole request if
 /// ANY resolved address is in the SSRF deny-set. This closes the DNS-rebinding
 /// bypass a host-string check alone cannot: a public name that resolves to
@@ -1086,6 +1101,7 @@ impl ObscuraHttpClient {
                 .redirect(Policy::none())
                 .timeout(self.timeout)
                 .connect_timeout(connect_timeout())
+                .read_timeout(read_timeout())
                 .danger_accept_invalid_certs(false)
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.

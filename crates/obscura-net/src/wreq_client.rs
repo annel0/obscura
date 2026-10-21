@@ -229,6 +229,7 @@ impl StealthHttpClient {
             )
             .timeout(Duration::from_secs(30))
             .connect_timeout(crate::client::connect_timeout())
+            .read_timeout(crate::client::read_timeout())
             // SSRF guard: reject hostnames that resolve to a private/loopback
             // IP. Use the same opt-in as the `validate_url` calls below so
             // `--allow-private-network` reaches this transport (#793); the
