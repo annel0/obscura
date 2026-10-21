@@ -1305,6 +1305,7 @@ impl ObscuraJsRuntime {
             gs.render_resource_tx = tx;
             gs.render_resource_rx = rx;
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
+            gs.style_read_stylesheets = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
             gs.scroll_offset = (0.0, 0.0);
@@ -4109,6 +4110,7 @@ impl ObscuraJsRuntime {
             state.render_resource_tx = tx;
             state.render_resource_rx = rx;
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
+            state.style_read_stylesheets = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
             state.element_scroll_offsets.clear();
             state.resolved_scroll = None;
@@ -10018,6 +10020,70 @@ mod tests {
         })()"#).unwrap(), serde_json::json!([
             "rgb(255, 0, 0)", "rgb(0, 0, 255)", "inline", "rgb(0, 128, 0)"
         ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn transition_timing_reads_skip_layout_and_keep_their_answers() {
+        // No CSS animation: listing a target's animations needs its styles.
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            #box { width:80px; transition:opacity .3s ease .1s }
+        </style><body><div id=box style="transition-duration:.5s">text</div></body>"#);
+        rt.set_viewport(400.0, 200.0);
+        let read = r#"(() => {
+            const style = getComputedStyle(document.getElementById('box'));
+            return [style.transitionDuration, style.transitionDelay, style.animationDuration, style.display];
+        })()"#;
+        let prepares = rt.state.borrow().stylesheet_cache.miss_count();
+        let before = rt.evaluate(read).unwrap();
+        // `display` may prepare the document once; the timing reads never do.
+        assert!(rt.state.borrow().stylesheet_cache.miss_count() <= prepares + 1);
+        rt.evaluate("document.getElementById('box').setAttribute('data-x', '1')").unwrap();
+        let prepares = rt.state.borrow().stylesheet_cache.miss_count()
+            + rt.state.borrow().stylesheet_cache.hit_count();
+        rt.evaluate(r#"(() => {
+            const style = getComputedStyle(document.getElementById('box'));
+            return [style.transitionDuration, style.transitionDelay, style.animationDelay];
+        })()"#).unwrap();
+        assert_eq!(rt.state.borrow().stylesheet_cache.miss_count() + rt.state.borrow().stylesheet_cache.hit_count(),
+            prepares, "timing reads prepared the document");
+        // The complete snapshot has none of these, so a layout changes no answer.
+        rt.evaluate("document.getElementById('box').getBoundingClientRect().width").unwrap();
+        let id = rt.with_dom(|dom| dom.get_element_by_id("box").unwrap()).unwrap();
+        let keys: Vec<&str> = rt.state.borrow().prepared_render.as_ref().unwrap()
+            .computed_style(id).unwrap().into_keys().collect();
+        assert!(keys.len() > 20);
+        assert!(keys.iter().all(|key| !obscura_render::dom::NonGeometricStyleCache::never_computed(key)),
+            "the snapshot now computes {keys:?}");
+        assert_eq!(rt.evaluate(read).unwrap(), before);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_geometric_read_after_a_sheet_change_parses_without_layout() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            #box { width:80px; height:20px; opacity:.5 }
+        </style><body><div id=box>text</div></body>"#);
+        rt.set_viewport(400.0, 200.0);
+        assert_eq!(rt.evaluate("document.getElementById('box').getBoundingClientRect().width").unwrap(),
+            serde_json::json!(80.0));
+        assert_eq!(rt.state.borrow().stylesheet_cache.miss_count(), 1);
+        // A route change adds its chunk's sheet, then a transition reads the
+        // opacity it starts from.
+        assert_eq!(rt.evaluate(r#"(() => {
+            const sheet = document.createElement('style');
+            sheet.textContent = '#box { opacity:.25; width:160px }';
+            document.head.appendChild(sheet);
+            return getComputedStyle(document.getElementById('box')).opacity;
+        })()"#).unwrap(), serde_json::json!("0.25"));
+        {
+            let state = rt.state.borrow();
+            assert_eq!(state.stylesheet_cache.miss_count(), 1, "the read laid the document out");
+            assert_eq!(state.style_read_stylesheets.miss_count(), 1);
+        }
+        assert_eq!(rt.evaluate("document.getElementById('box').getBoundingClientRect().width").unwrap(),
+            serde_json::json!(160.0));
+        assert_eq!(rt.state.borrow().stylesheet_cache.miss_count(), 2);
     }
 
     #[cfg(feature = "render")]

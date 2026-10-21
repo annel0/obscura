@@ -9891,6 +9891,16 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   // width/height from the synthesized bounding rect makes those libraries
   // actually render content.
   const dimensionFor = (name) => {
+    // Only these read the box: any other property missing from the snapshot
+    // (transition timings, say) must not lay the document out to fall back.
+    switch (name) {
+      case 'width': case 'inline-size': case 'height': case 'block-size':
+      case 'left': case 'top': case 'right': case 'bottom':
+      case 'client-width': case 'offset-width': case 'client-height': case 'offset-height':
+        break;
+      default:
+        return null;
+    }
     try {
       const r = el.getBoundingClientRect && el.getBoundingClientRect();
       if (!r) return null;

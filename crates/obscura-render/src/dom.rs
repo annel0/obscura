@@ -4567,6 +4567,14 @@ impl NonGeometricStyleCache {
             | "background-origin" | "background-clip" | "color")
     }
 
+    /// Properties no computed-style snapshot holds: the renderer does not
+    /// model transitions or report animation longhands, so the page's own
+    /// fallback answers them whatever the layout. Vue reads all four
+    /// durations and delays before every transition.
+    pub fn never_computed(property: &str) -> bool {
+        property.starts_with("transition") || property.starts_with("animation")
+    }
+
     pub fn new(
         tree: &DomTree,
         viewport: (f32, f32),
@@ -4576,6 +4584,20 @@ impl NonGeometricStyleCache {
         let sources = document_stylesheet_sources(tree, viewport, media_type);
         let sheet = cache.get(&sources, viewport, media_type)?;
         Some(Self::from_sheet(tree, viewport, sheet))
+    }
+
+    /// Like `new`, parsing the document's stylesheets into `cache` when it
+    /// does not hold them. `cache` must not be the one retained layout is
+    /// validated against: a style read must not move that key.
+    pub fn new_parsing(
+        tree: &DomTree,
+        viewport: (f32, f32),
+        media_type: crate::CssMediaType,
+        cache: &mut crate::css::StylesheetCache,
+    ) -> Self {
+        let sources = document_stylesheet_sources(tree, viewport, media_type);
+        let (sheet, _) = cache.get_or_parse(tree, &sources, viewport, media_type);
+        Self::from_sheet(tree, viewport, sheet)
     }
 
     fn from_sheet(tree: &DomTree, viewport: (f32, f32), sheet: std::sync::Arc<crate::css::Stylesheet>) -> Self {

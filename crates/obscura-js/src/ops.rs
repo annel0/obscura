@@ -528,6 +528,12 @@ pub struct ObscuraState {
     pub stylesheet_cache: obscura_render::StylesheetCache,
     #[cfg(feature = "render")]
     pub(crate) style_query_cache: Option<StyleQueryCache>,
+    /// Stylesheets parsed for non-geometric style reads made after the
+    /// sheets changed, so such a read does not lay the document out. Apart
+    /// from `stylesheet_cache`, whose key retained layout is validated
+    /// against.
+    #[cfg(feature = "render")]
+    pub(crate) style_read_stylesheets: obscura_render::StylesheetCache,
     /// Script-created faces in this document's `FontFaceSet`. This is separate
     /// from the DOM so the bridge does not manufacture a selector-visible
     /// `<style>` element merely to feed the renderer.
@@ -730,6 +736,8 @@ impl ObscuraState {
             stylesheet_cache: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
             style_query_cache: None,
+            #[cfg(feature = "render")]
+            style_read_stylesheets: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
@@ -9319,6 +9327,11 @@ fn op_computed_style(
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
+    if pseudo.is_empty() && obscura_render::dom::NonGeometricStyleCache::never_computed(&property) {
+        // Partial and empty: the bridge falls back for this property alone
+        // and asks again for any other.
+        return serde_json::json!([false, {}]).to_string();
+    }
     let base_url = document_base_url_for_javascript_task(&gs);
     let needs_style_resolution = gs.prepared_render.as_ref().is_none_or(|prepared| {
         prepared.viewport() != gs.viewport || prepared.base_url() != base_url.as_deref()
@@ -9336,10 +9349,16 @@ fn op_computed_style(
                 && cache.stylesheet_generation == stylesheet_generation
                 && cache.viewport == gs.viewport && cache.media == gs.render_media
         }) {
-            cached = gs.dom.as_ref().and_then(|dom| {
+            let state = &mut *gs;
+            cached = state.dom.as_ref().map(|dom| {
                 obscura_render::dom::NonGeometricStyleCache::new(
-                    dom, gs.viewport, gs.render_media, &gs.stylesheet_cache,
+                    dom, state.viewport, state.render_media, &state.stylesheet_cache,
                 )
+                // The sheets changed since the last prepare: parse them for
+                // the read instead of laying the whole document out.
+                .unwrap_or_else(|| obscura_render::dom::NonGeometricStyleCache::new_parsing(
+                    dom, state.viewport, state.render_media, &mut state.style_read_stylesheets,
+                ))
             }).map(|cascade| StyleQueryCache {
                 task_generation: gs.animation_task_generation,
                 activity_generation: gs.activity_generation,
