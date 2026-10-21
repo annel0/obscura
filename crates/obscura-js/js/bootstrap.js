@@ -4079,7 +4079,7 @@ class Element extends Node {
     // SVG elements reflect class as an SVGAnimatedString (.baseVal/.animVal),
     // not a plain string. Anti-fraud sensors read el.className.animVal.
     if (this.namespaceURI === "http://www.w3.org/2000/svg") {
-      if (!this._svgClassName) this._svgClassName = new SVGAnimatedString(this, "class");
+      if (!this._svgClassName) this._svgClassName = new SVGAnimatedString(_svgAnimatedStringKey, this, "class");
       return this._svgClassName;
     }
     return this.getAttribute("class") || "";
@@ -4846,6 +4846,25 @@ class Element extends Node {
       this.textContent = value;
     }
   }
+  // defaultValue is the markup's value: the value attribute of an <input>,
+  // the text of a <textarea>. Vue's v-model reads it on every text field.
+  get defaultValue() {
+    const tag = this.localName;
+    if (tag === 'input') return this.getAttribute('value') ?? '';
+    if (tag === 'textarea') return this.textContent;
+    return undefined;
+  }
+  set defaultValue(v) {
+    const tag = this.localName;
+    if (tag === 'input') this.setAttribute('value', String(v));
+    else if (tag === 'textarea') this.textContent = String(v);
+  }
+  get defaultChecked() {
+    return this.localName === 'input' ? this.hasAttribute('checked') : undefined;
+  }
+  set defaultChecked(v) {
+    if (this.localName === 'input') this.toggleAttribute('checked', !!v);
+  }
   get min() { return this.getAttribute('min') || ''; }
   set min(v) { this.setAttribute('min', v); }
   get max() { return this.getAttribute('max') || ''; }
@@ -5020,7 +5039,7 @@ class Element extends Node {
         (ln === 'a' || ln === 'image' || ln === 'use' || ln === 'script' ||
          ln === 'pattern' || ln === 'filter' || ln === 'textPath' || ln === 'mpath' ||
          ln === 'linearGradient' || ln === 'radialGradient' || ln === 'feImage' || ln === 'tref')) {
-      if (!this._svgHref) this._svgHref = new SVGAnimatedString(this, "href", "xlink:href");
+      if (!this._svgHref) this._svgHref = new SVGAnimatedString(_svgAnimatedStringKey, this, "href", "xlink:href");
       return this._svgHref;
     }
     if (ln === 'a' || ln === 'area' || ln === 'link') {
@@ -14198,7 +14217,13 @@ globalThis.HTMLDialogElement = Element;
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
 // baseVal is writable. Used by the SVG-aware get className()/get href() above.
-function SVGAnimatedString(el, attr, fallbackAttr) {
+// It is a global like in Chrome (pages test `className instanceof
+// SVGAnimatedString`), and like there only the engine can construct one.
+const _svgAnimatedStringKey = Symbol("SVGAnimatedString");
+function SVGAnimatedString(key, el, attr, fallbackAttr) {
+  if (key !== _svgAnimatedStringKey) {
+    throw new TypeError("Failed to construct 'SVGAnimatedString': Illegal constructor");
+  }
   this._el = el;
   this._attr = attr;
   this._fallback = fallbackAttr || null;
@@ -14219,6 +14244,7 @@ Object.defineProperty(SVGAnimatedString.prototype, 'animVal', {
 });
 Object.defineProperty(SVGAnimatedString.prototype, Symbol.toStringTag, { value: 'SVGAnimatedString', configurable: true });
 _markNative(SVGAnimatedString);
+globalThis.SVGAnimatedString = SVGAnimatedString;
 
 class SVGElement extends Element {
   get [Symbol.toStringTag]() { return "SVGElement"; }

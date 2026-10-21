@@ -8672,6 +8672,60 @@ mod tests {
     }
 
     #[test]
+    fn form_fields_expose_their_default_value() {
+        let mut rt = setup_runtime(
+            "<html><body><input id=i value='a\nb'><input id=c type=checkbox checked><textarea id=t>x\r\ny</textarea></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const input = document.getElementById("i");
+                const box = document.getElementById("c");
+                const area = document.getElementById("t");
+                // What Vue's v-model created() hook does with them.
+                const cleaned = input.defaultValue.replace(/[\r\n]/g, "");
+                input.value = "typed";
+                const kept = input.defaultValue;
+                input.defaultValue = "z";
+                box.defaultChecked = false;
+                return [
+                    cleaned,
+                    kept,
+                    input.getAttribute("value"),
+                    area.defaultValue,
+                    box.hasAttribute("checked"),
+                    document.createElement("div").defaultValue === undefined,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["ab", "a\nb", "z", "x\ny", false, true]));
+    }
+
+    #[test]
+    fn svg_animated_string_is_a_global_interface() {
+        let mut rt = setup_runtime("<html><body><svg class='icon'><a href='#x'></a></svg></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const svg = document.querySelector("svg");
+                let constructed = "constructed";
+                try { new SVGAnimatedString(); } catch (e) { constructed = e.constructor.name; }
+                return [
+                    typeof SVGAnimatedString,
+                    svg.className instanceof SVGAnimatedString,
+                    svg.querySelector("a").href instanceof SVGAnimatedString,
+                    svg.className.baseVal,
+                    constructed,
+                    document.createElement("div").className instanceof SVGAnimatedString,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["function", true, true, "icon", "TypeError", false]));
+    }
+
+    #[test]
     fn html_lookalike_tags_keep_their_html_interfaces() {
         // A `<text>` or `<image>` in the HTML namespace is not an SVG element,
         // so the new SVG table must not claim it.
