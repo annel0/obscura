@@ -713,7 +713,8 @@ function _fpNoise(x, y, channel) {
 }
 
 var _fpCache = null;
-function _getFp() {
+// Parenthesized helpers retain compiled bytecode in the startup snapshot.
+const _getFp = (function _getFp() {
   if (_fpCache) return _fpCache;
   const _uaPlat = globalThis.__obscura_ua_platform || 'Windows';
   const isMac = _uaPlat === 'macOS';
@@ -781,7 +782,7 @@ function _getFp() {
     canvasFingerprint: cfp,
   };
   return _fpCache;
-}
+});
 function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
@@ -7614,7 +7615,7 @@ globalThis.TextTrackCue = TextTrackCue;
 globalThis.TextTrackCueList = TextTrackCueList;
 globalThis.VTTCue = VTTCue;
 
-function _elementClassFor(nid) {
+const _elementClassFor = (function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
   // case, so keep the common HTML path fast and only inspect the native
@@ -7655,8 +7656,8 @@ function _elementClassFor(nid) {
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
   return Element;
-}
-function _elementClassForKnownName(namespace, qualifiedName) {
+});
+const _elementClassForKnownName = (function _elementClassForKnownName(namespace, qualifiedName) {
   const localName = qualifiedName.includes(":")
     ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
     : qualifiedName;
@@ -7682,8 +7683,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "TRACK") return HTMLTrackElement;
   }
   return Element;
-}
-function _wrap(nid) {
+});
+const _wrap = (function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
@@ -7698,15 +7699,15 @@ function _wrap(nid) {
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
-}
-function _wrapEl(nid) {
+});
+const _wrapEl = (function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const C = _elementClassFor(nid);
   const n = new C(nid);
   _cache.set(nid, n);
   return n;
-}
+});
 
 globalThis._wrap = _wrap;
 globalThis.self = globalThis;
@@ -8456,7 +8457,7 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
-async function _fetch(input, init = {}, resourceType = "Fetch") {
+const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") {
   init = init || {};
   const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
@@ -8558,7 +8559,7 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
     });
   }
   return response;
-}
+});
 globalThis.fetch = (input, init = {}) => _fetch(input, init);
 
 if (typeof Headers === "undefined") {
@@ -18255,7 +18256,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 
 // Ops are bound after snapshot restoration, so probe the renderer at realm
 // initialization, not while building the snapshot with an empty op table.
-function _installCaretGeometry() {
+const _installCaretGeometry = (function _installCaretGeometry() {
   if (typeof __obscuraCore.ops.op_layout_caret !== 'function') return {};
   const positions = new WeakMap();
   function positionState(receiver) {
@@ -18356,7 +18357,7 @@ function _installCaretGeometry() {
     caretRangeFromPoint: Document.prototype.caretRangeFromPoint,
     caretPositionFromPoint: Document.prototype.caretPositionFromPoint,
   };
-}
+});
 
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
@@ -18372,7 +18373,7 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['elementStyle', function() { return _elementStyle(this); }],
 ]));
 
-globalThis.__obscura_init = function() {
+globalThis.__obscura_init = (function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _scriptingEnabled = _domParse('scripting_enabled') !== false;
@@ -18479,7 +18480,7 @@ globalThis.__obscura_init = function() {
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
   delete globalThis.__obscura_init;
-};
+});
 
 // Snapshot-time pre-computation of the hide list. Bootstrap.js runs once
 // during the V8 snapshot build (build.rs); this line captures the set of

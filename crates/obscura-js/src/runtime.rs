@@ -45,17 +45,14 @@ impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
-/// Serializes V8 isolate construction across OS threads. The thread-per-
-/// connection server (issue #430) builds isolates on many threads. The main
-/// thread already warms up V8 once before any connection thread starts (see the
-/// `ObscuraJsRuntime::new` warmup in `obscura-cdp` server startup), which is
-/// what actually prevents the `InitializeBuiltinJSDispatchTable` segfault of a
-/// first isolate built off the main thread. This lock is defense-in-depth: it
-/// keeps two connections from running V8's isolate setup concurrently in case
-/// any residual first-time process init races. Construction is rare and fast, so
-/// serializing it costs nothing measurable; isolate *execution* stays fully
-/// parallel, each isolate on its own thread with no shared lock.
+/// Serialize first initialization (#430), then allow two snapshot restorations
+/// at a time. Unbounded construction increases CPU and peak memory contention.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ISOLATE_CREATE_SECOND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static NEXT_ISOLATE_CREATE_SLOT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static ISOLATE_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static NEXT_CDP_OBJECT_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 #[cfg(test)]
@@ -621,14 +618,18 @@ impl ObscuraJsRuntime {
         let loaded_module_specifiers = module_loader.loaded_specifiers();
         let module_loader = Rc::new(module_loader);
 
-        // Build the isolate under the process-wide creation lock so two
-        // connection threads never construct isolates concurrently (#430).
         let (runtime, isolate_handle, heap_limit_state) = {
             // Keep the guard alive for the whole construction: deno_core
             // captures the current tokio handle at `JsRuntime::new` time and
             // aborts if a V8 delayed task is posted without one.
             let _tokio_guard = enter_tokio_context();
-            let _create_guard = ISOLATE_CREATE_LOCK
+            let create_lock = if ISOLATE_INITIALIZED.load(std::sync::atomic::Ordering::Acquire)
+                && NEXT_ISOLATE_CREATE_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 != 0 {
+                &ISOLATE_CREATE_SECOND_LOCK
+            } else {
+                &ISOLATE_CREATE_LOCK
+            };
+            let _create_guard = create_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -636,10 +637,11 @@ impl ObscuraJsRuntime {
             // so Intl.* formats and resolvedOptions().locale leaked the
             // operator's real locale (an en-AU host showed en-AU) while
             // navigator.language and Accept-Language say en-US. Pin the one
-            // locale the other surfaces claim (#734). Process-global and
-            // idempotent; setting it under the create lock guarantees it
-            // lands before the first isolate exists.
-            deno_core::v8::icu::set_default_locale("en-US");
+            // locale the other surfaces claim (#734). This is process-global.
+            // Set it under the first-creation lock, before parallel restorations.
+            if !ISOLATE_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+                deno_core::v8::icu::set_default_locale("en-US");
+            }
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: if cfg!(obscura_external_bootstrap) {
@@ -679,6 +681,7 @@ impl ObscuraJsRuntime {
                 )
                 .expect("init should not fail");
 
+            ISOLATE_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
             (runtime, isolate_handle, heap_limit_state)
         };
 
@@ -4645,6 +4648,34 @@ mod tests {
 
     use super::*;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn one_busy_isolate_constructor_does_not_block_all_pages() {
+        let warmup = ObscuraJsRuntime::new();
+        let guard = ISOLATE_CREATE_LOCK.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers = (0..8).map(|id| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for _ in 0..4 {
+                    let mut rt = ObscuraJsRuntime::new();
+                    rt.set_dom(parse_html("<p id='value'>fresh</p>"));
+                    rt.run_page_init();
+                    assert_eq!(rt.evaluate("typeof globalThis.worker").unwrap(), serde_json::json!("undefined"));
+                    rt.execute_script("worker", &format!("globalThis.worker={id};")).unwrap();
+                    assert_eq!(rt.evaluate("[worker,document.getElementById('value').textContent]").unwrap(),
+                        serde_json::json!([id, "fresh"]));
+                    tx.send(()).unwrap();
+                }
+            })
+        }).collect::<Vec<_>>();
+        let independent = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        drop(guard);
+        for worker in workers { worker.join().unwrap(); }
+        drop(warmup);
+        assert!(independent, "one busy isolate constructor blocked every page");
+        assert_eq!(rx.try_iter().count(), 31);
+    }
 
     #[test]
     fn completed_scripts_do_not_wait_for_watchdog_deadline() {
