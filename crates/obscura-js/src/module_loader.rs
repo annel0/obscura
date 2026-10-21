@@ -13,6 +13,7 @@ use deno_core::ModuleLoader;
 use deno_core::ModuleSource;
 use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
+use deno_core::SourceCodeCacheInfo;
 
 use deno_error::JsErrorBox;
 
@@ -154,7 +155,95 @@ fn io_err(msg: String) -> ModuleLoaderError {
     JsErrorBox::from_err(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
 
+/// V8 code caches of ES modules, shared by every page in the process and
+/// keyed by URL and source hash: the pages of one site load the same bundle,
+/// and compiling it again for each is avoidable work. V8 checks a cache
+/// against the source and rejects one that does not match.
+/// OBSCURA_MODULE_CODE_CACHE_MB sizes it (128 MB; 0 turns it off).
+struct ModuleCodeCache {
+    entries: std::collections::HashMap<String, (u64, Arc<[u8]>)>,
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+fn module_code_cache_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("OBSCURA_MODULE_CODE_CACHE_MB")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(128)
+            * 1024
+            * 1024
+    })
+}
+
+fn module_code_cache() -> &'static std::sync::Mutex<ModuleCodeCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ModuleCodeCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::sync::Mutex::new(ModuleCodeCache {
+            entries: Default::default(),
+            order: Default::default(),
+            bytes: 0,
+        })
+    })
+}
+
+fn source_hash(code: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    code.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The cache entry to hand deno_core for a module: stored bytes when the
+/// source is the one they were made from, otherwise a request to make them.
+fn module_code_cache_info(url: &str, code: &str) -> Option<SourceCodeCacheInfo> {
+    if module_code_cache_limit() == 0 {
+        return None;
+    }
+    let hash = source_hash(code);
+    let data = module_code_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.entries.get(url).filter(|(stored, _)| *stored == hash).map(|(_, bytes)| bytes.clone()))
+        .map(|bytes| std::borrow::Cow::Owned(bytes.to_vec()));
+    tracing::debug!(target: "obscura_js::code_cache", url, hit = data.is_some(), "module code cache");
+    Some(SourceCodeCacheInfo { hash, data })
+}
+
+fn store_module_code_cache(url: String, hash: u64, data: &[u8]) {
+    let limit = module_code_cache_limit();
+    if limit == 0 || data.len() > limit / 4 {
+        return;
+    }
+    let Ok(mut cache) = module_code_cache().lock() else { return };
+    if let Some((_, previous)) = cache.entries.remove(&url) {
+        cache.bytes -= previous.len();
+        cache.order.retain(|queued| queued != &url);
+    }
+    while cache.bytes + data.len() > limit {
+        let Some(oldest) = cache.order.pop_front() else { break };
+        if let Some((_, evicted)) = cache.entries.remove(&oldest) {
+            cache.bytes -= evicted.len();
+        }
+    }
+    cache.bytes += data.len();
+    cache.order.push_back(url.clone());
+    cache.entries.insert(url, (hash, Arc::from(data)));
+}
+
 impl ModuleLoader for ObscuraModuleLoader {
+    fn code_cache_ready(
+        &self,
+        module_specifier: ModuleSpecifier,
+        hash: u64,
+        code_cache: &[u8],
+    ) -> Pin<Box<dyn std::future::Future<Output = ()>>> {
+        store_module_code_cache(module_specifier.to_string(), hash, code_cache);
+        Box::pin(async {})
+    }
+
     fn resolve(
         &self,
         specifier: &str,
@@ -366,16 +455,34 @@ impl ModuleLoader for ObscuraModuleLoader {
                             .push(found.to_string());
                     }
                     let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                    let code_cache = module_code_cache_info(found.as_str(), &code);
                     Ok(ModuleSource::new_with_redirect(
                         deno_core::ModuleType::JavaScript,
                         ModuleSourceCode::String(code.into()),
                         &requested,
                         &found,
-                        None,
+                        code_cache,
                     ))
                 }
                 Err(error) => Err(io_err(error)),
             }
         })))
+    }
+}
+
+#[cfg(test)]
+mod code_cache_tests {
+    use super::*;
+
+    #[test]
+    fn module_code_cache_hands_back_bytes_for_the_same_source_only() {
+        let url = "https://example.test/code-cache/app.js";
+        let first = module_code_cache_info(url, "export const a = 1;").unwrap();
+        assert!(first.data.is_none(), "nothing stored yet");
+        store_module_code_cache(url.to_string(), first.hash, b"v8-cache");
+        let again = module_code_cache_info(url, "export const a = 1;").unwrap();
+        assert_eq!(again.data.as_deref(), Some(&b"v8-cache"[..]));
+        let changed = module_code_cache_info(url, "export const a = 2;").unwrap();
+        assert!(changed.data.is_none(), "a changed source must not reuse the cache");
     }
 }
