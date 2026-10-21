@@ -3396,6 +3396,9 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(fetch_timeout())
+        // Fail fast on hosts that never accept the connection, like the page
+        // client does (see obscura_net::connect_timeout).
+        .connect_timeout(obscura_net::connect_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
         .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
             false,

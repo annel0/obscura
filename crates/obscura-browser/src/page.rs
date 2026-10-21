@@ -2499,21 +2499,25 @@ impl Page {
         // 16 is well above the per-host pool ceiling most browsers use
         // and matches what real Chrome does for a given origin.
         use futures::StreamExt as _;
-        let fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
-        let fetch_results = match tokio::time::timeout_at(
-            script_deadline,
-            fetch_stream.collect::<Vec<_>>(),
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(_) => {
-                tracing::warn!(
-                    "execute_scripts: fetch deadline reached, some scripts may not have loaded"
-                );
-                Vec::new()
+        let mut fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
+        // Keep each script as it arrives. Collecting the batch all-or-nothing
+        // meant one fetch that outlived the deadline threw away every script
+        // that had already loaded, and the page ran no JavaScript at all.
+        let mut fetch_results = Vec::with_capacity(fetch_tasks.len());
+        loop {
+            match tokio::time::timeout_at(script_deadline, fetch_stream.next()).await {
+                Ok(Some(result)) => fetch_results.push(result),
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        "execute_scripts: fetch deadline reached, {} of {} scripts did not load",
+                        fetch_tasks.len() - fetch_results.len(),
+                        fetch_tasks.len(),
+                    );
+                    break;
+                }
             }
-        };
+        }
 
         let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
             std::collections::HashMap::new();

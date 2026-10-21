@@ -594,6 +594,21 @@ impl Default for CallbackRegistry {
 
 pub use obscura_ssrf::{env_allows_private_network, is_forbidden_ip};
 
+/// Budget for opening a connection (TCP connect plus TLS handshake), separate
+/// from the 30s whole-request timeout, so it never cuts a slow download short.
+/// Without it a host that silently drops packets (an ad network blocked on the
+/// visitor's network) holds its request for the full 30s; the parser-discovered
+/// script batch waits on its slowest member, so on habr.com one blackholed
+/// `<script async>` used up the page's whole script budget and no script ran.
+/// OBSCURA_CONNECT_TIMEOUT_MS overrides the 10s default.
+pub fn connect_timeout() -> Duration {
+    let timeout_ms = std::env::var("OBSCURA_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000);
+    Duration::from_millis(timeout_ms)
+}
+
 /// DNS resolver that performs the lookup and then rejects the whole request if
 /// ANY resolved address is in the SSRF deny-set. This closes the DNS-rebinding
 /// bypass a host-string check alone cannot: a public name that resolves to
@@ -1070,6 +1085,7 @@ impl ObscuraHttpClient {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
                 .timeout(self.timeout)
+                .connect_timeout(connect_timeout())
                 .danger_accept_invalid_certs(false)
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.
