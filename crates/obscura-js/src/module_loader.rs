@@ -278,7 +278,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     // Keep failed and cancelled graph fetches visible to the
                     // same Network listeners as ordinary fetch/XHR failures.
                     let mut network_guard = page_state.as_ref().map(|state| FetchNetworkGuard {
-                        state: state.clone(), cancel: None,
+                        state: state.clone(), cancel: None, same_site_in_flight: None,
                         event: Some(JsNetworkEvent {
                             request_id: request_id.clone(), intercepted: false,
                             url: url.clone(), method: "GET".to_string(),

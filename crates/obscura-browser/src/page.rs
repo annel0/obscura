@@ -395,6 +395,42 @@ struct ScriptPrefetch {
     finished: std::collections::HashSet<usize>,
 }
 
+/// When `Page::settle_content` considers a page's content settled.
+#[derive(Debug, Clone, Copy)]
+pub struct SettlePolicy {
+    /// Upper bound for the whole wait.
+    pub budget: std::time::Duration,
+    /// DOM quiet required while `load` has not fired.
+    pub quiet: std::time::Duration,
+    /// DOM quiet required once `load` has fired and the page's own load work
+    /// is done.
+    pub quiet_after_load: std::time::Duration,
+    /// How long third-party requests and dynamic scripts in flight hold the
+    /// wait. fetch()/XHR to the page's own site holds it until `budget`.
+    pub grace: std::time::Duration,
+}
+
+impl Default for SettlePolicy {
+    fn default() -> Self {
+        Self {
+            budget: std::time::Duration::from_secs(5),
+            quiet: std::time::Duration::from_millis(500),
+            quiet_after_load: std::time::Duration::from_millis(200),
+            grace: std::time::Duration::from_secs(1),
+        }
+    }
+}
+
+/// How `Page::settle_content` ended.
+#[derive(Debug, Clone, Copy)]
+pub struct ContentSettle {
+    /// The document went quiet; false means the budget ran out first.
+    pub settled: bool,
+    /// `load` had fired by the time the wait ended.
+    pub load_fired: bool,
+    pub elapsed: std::time::Duration,
+}
+
 /// What is left of the script phase once DOMContentLoaded has fired, kept when
 /// navigation returns at DOMContentLoaded instead of waiting for `load`: async
 /// scripts still downloading and the load event itself. Like a browser, the
@@ -2754,6 +2790,68 @@ impl Page {
                 return false;
             }
             self.wait_pending_load(until).await;
+        }
+    }
+
+    /// Waits until the document's content has settled, for a crawler or a
+    /// capture that needs the page as a reader sees it rather than its load
+    /// event: no observable DOM mutation for the policy's quiet window, no
+    /// fetch()/XHR to the page's own site in flight, and no other request or
+    /// dynamic script in flight unless it has been pending for longer than
+    /// the grace period (a tracker or ad host that never answers is not
+    /// content). A load phase left by a DOMContentLoaded navigation keeps
+    /// advancing meanwhile (late async scripts run as they land), but `load`
+    /// itself is not awaited. Bounded by the policy's budget.
+    pub async fn settle_content(&mut self, policy: SettlePolicy) -> ContentSettle {
+        const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        let deadline = started + policy.budget;
+        let grace_until = started + policy.grace;
+        let mut generation = self.js.as_ref().map_or(0, |js| js.activity_generation());
+        let mut quiet_since = started;
+        loop {
+            if self.pending_load.is_some() {
+                self.step_pending_load();
+            }
+            let load_fired = self.pending_load.is_none();
+            let now = tokio::time::Instant::now();
+            let Some(js) = self.js.as_mut() else {
+                return ContentSettle { settled: true, load_fired: true, elapsed: started.elapsed() };
+            };
+            let current = js.activity_generation();
+            if current != generation {
+                generation = current;
+                quiet_since = now;
+            }
+            // Once `load` has fired the page considers itself loaded, so only
+            // its own data requests still hold the wait.
+            let network = js.has_pending_same_site_requests()
+                || (!load_fired
+                    && now < grace_until
+                    && (js.has_pending_network_requests() || js.has_pending_dynamic_scripts()));
+            let quiet = if load_fired { policy.quiet_after_load } else { policy.quiet };
+            if !network && now.duration_since(quiet_since) >= quiet {
+                return ContentSettle {
+                    settled: true,
+                    load_fired: self.pending_load.is_none(),
+                    elapsed: started.elapsed(),
+                };
+            }
+            if now >= deadline {
+                return ContentSettle {
+                    settled: false,
+                    load_fired: self.pending_load.is_none(),
+                    elapsed: started.elapsed(),
+                };
+            }
+            let slice_end = (now + SLICE).min(deadline);
+            if self.pending_load.is_some() {
+                self.wait_pending_load(slice_end).await;
+            } else if let Some(js) = self.js.as_mut() {
+                let _ = tokio::time::timeout_at(slice_end, js.run_autonomous_event_loop_turn()).await;
+                // A turn with nothing to do returns at once; do not spin.
+                tokio::time::sleep_until(slice_end).await;
+            }
         }
     }
 

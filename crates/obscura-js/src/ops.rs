@@ -432,6 +432,10 @@ pub struct ObscuraState {
     /// transport client across pages, so the client's aggregate counter cannot
     /// be used as a page-readiness signal.
     pub page_in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// The subset of `page_in_flight` addressed to the page's own site. A
+    /// settle policy waits for these (they are the app's data) but gives up
+    /// on third-party ones (trackers, ads) after a grace period.
+    pub page_in_flight_same_site: Arc<std::sync::atomic::AtomicU32>,
     /// Monotonic generation for observable changes to the connected document.
     /// The browser settle policy samples this to distinguish useful deferred
     /// rendering work from unrelated long-lived timers.
@@ -617,6 +621,7 @@ impl ObscuraState {
         self.blocked_urls = parent.blocked_urls.clone();
         self.intercept_enabled = parent.intercept_enabled;
         self.page_in_flight = parent.page_in_flight.clone();
+        self.page_in_flight_same_site = parent.page_in_flight_same_site.clone();
         #[cfg(feature = "stealth")]
         {
             self.stealth_client = parent.stealth_client.clone();
@@ -678,6 +683,7 @@ impl ObscuraState {
             pending_frame_messages: Vec::new(),
             pending_frame_message_bytes: 0,
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            page_in_flight_same_site: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
             base_url_cache: RefCell::new(None),
@@ -976,6 +982,32 @@ async fn read_body_capped(
     Ok(buf)
 }
 
+/// Whether `url` is on the same site as the page `origin`, comparing hosts by
+/// their registrable domain approximated as the last two labels (three under
+/// a two-letter country code with a generic second level, like `co.uk`).
+fn same_site_as_page(url: &str, origin: &str) -> bool {
+    let host = |value: &str| {
+        url::Url::parse(value).ok().and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+    };
+    let (Some(request), Some(page)) = (host(url), host(origin)) else {
+        return false;
+    };
+    site_key(&request) == site_key(&page)
+}
+
+fn site_key(host: &str) -> String {
+    let host = host.trim_end_matches('.');
+    if host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        return host.to_string();
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let generic_second_level = labels.len() >= 3
+        && labels[labels.len() - 1].len() == 2
+        && matches!(labels[labels.len() - 2], "co" | "com" | "net" | "org" | "gov" | "edu" | "ac");
+    let keep = if generic_second_level { 3 } else { 2 };
+    labels[labels.len().saturating_sub(keep)..].join(".")
+}
+
 struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
 impl Drop for PageInFlightGuard {
     fn drop(&mut self) {
@@ -1019,10 +1051,15 @@ pub(crate) struct FetchNetworkGuard {
     pub(crate) state: std::rc::Weak<RefCell<ObscuraState>>,
     pub(crate) event: Option<JsNetworkEvent>,
     pub(crate) cancel: Option<Rc<CancelHandle>>,
+    /// `page_in_flight_same_site`, held for a request to the page's own site.
+    pub(crate) same_site_in_flight: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl Drop for FetchNetworkGuard {
     fn drop(&mut self) {
+        if let Some(counter) = self.same_site_in_flight.take() {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(mut event) = self.event.take() else { return; };
         event.status = 0;
         event.error_text = Some(if self.cancel.as_ref().is_some_and(|cancel| cancel.is_canceled()) {
@@ -3989,6 +4026,21 @@ async fn fetch_url_inner(
     }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
+    // fetch()/XHR to the page's own site is its data; a settle policy waits
+    // for it and not for third-party requests (see page_in_flight_same_site).
+    // Scripts, even same-site ones, are not data: habr.com's own analytics
+    // script intermittently never answers.
+    let is_data = matches!(resource_type, ResourceType::Fetch | ResourceType::Xhr);
+    let same_site_in_flight = (is_data && same_site_as_page(&url, &origin)).then(|| {
+        let counter = state
+            .borrow()
+            .borrow::<SharedState>()
+            .borrow()
+            .page_in_flight_same_site
+            .clone();
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        counter
+    });
     let mut network_guard = FetchNetworkGuard {
         state: Rc::downgrade(state.borrow().borrow::<SharedState>()),
         event: Some(JsNetworkEvent {
@@ -3997,6 +4049,7 @@ async fn fetch_url_inner(
             resource_type: resource_type_name.to_string(),
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
         }),
+        same_site_in_flight,
         cancel: cancel.clone(),
     };
     let credentials = FetchCredentials::parse(&credentials);

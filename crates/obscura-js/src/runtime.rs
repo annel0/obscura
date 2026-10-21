@@ -1276,6 +1276,7 @@ impl ObscuraJsRuntime {
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        gs.page_in_flight_same_site = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
         // A new document owns a fresh retained scene and resource cache.
         #[cfg(feature = "render")]
@@ -3555,10 +3556,21 @@ impl ObscuraJsRuntime {
         self.state.borrow().activity_generation
     }
 
-    fn has_pending_network_requests(&self) -> bool {
+    /// Whether a fetch()/XHR or dynamic script request the page started is
+    /// still in flight.
+    pub fn has_pending_network_requests(&self) -> bool {
         let state = self.state.borrow();
         state
             .page_in_flight
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
+
+    /// Whether a request the page started to its own site is still in flight.
+    pub fn has_pending_same_site_requests(&self) -> bool {
+        self.state
+            .borrow()
+            .page_in_flight_same_site
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
     }
