@@ -15352,6 +15352,44 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_full_viewport_mode_reports_every_target_visible() {
+        crate::ops::INTERSECTION_FULL_VIEWPORT_FOR_TEST.with(|flag| flag.set(true));
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:5000px"></div>
+                <div id="far" style="height:100px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const records = [];
+                    const observer = new IntersectionObserver(entries => {
+                        for (const entry of entries) {
+                            records.push([entry.isIntersecting, entry.intersectionRatio]);
+                        }
+                    });
+                    observer.observe(document.getElementById("far"));
+                    setTimeout(() => resolve(records), 50);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        crate::ops::INTERSECTION_FULL_VIEWPORT_FOR_TEST.with(|flag| flag.set(false));
+        assert_eq!(result.value.unwrap(), serde_json::json!([[true, 1]]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_tracks_viewport_threshold_crossings() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">

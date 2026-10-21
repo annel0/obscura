@@ -9208,6 +9208,24 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
 
     let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
+    if intersection_full_viewport() {
+        // Every target (and root) fills the viewport: observers report each
+        // target intersecting once, and no layout is computed for it.
+        let (width, height) = gs.viewport;
+        let full = serde_json::json!({
+            "x": 0.0,
+            "y": 0.0,
+            "width": width,
+            "height": height,
+            "clientWidth": width,
+            "clientHeight": height,
+            "borderTopWidth": "0px",
+            "borderLeftWidth": "0px",
+            "overflowX": "visible",
+            "overflowY": "visible",
+        });
+        return serde_json::to_string(&vec![full; nids.len()]).unwrap_or_else(|_| "[]".to_string());
+    }
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
         return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
@@ -9248,6 +9266,30 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&measurements).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// OBSCURA_INTERSECTION_FULL_VIEWPORT=1: IntersectionObserver treats every
+/// target as filling the viewport instead of measuring it. Measuring needs a
+/// fresh layout after every DOM change, which was most of the layouts a
+/// documentation site's render paid for. A crawler wants what a very tall
+/// viewport shows (lazy content loaded), which this gives without layout.
+#[cfg(test)]
+thread_local! {
+    /// Lets a test turn the full-viewport mode on for its own thread.
+    pub(crate) static INTERSECTION_FULL_VIEWPORT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "render")]
+fn intersection_full_viewport() -> bool {
+    #[cfg(test)]
+    if INTERSECTION_FULL_VIEWPORT_FOR_TEST.with(std::cell::Cell::get) {
+        return true;
+    }
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| {
+        std::env::var("OBSCURA_INTERSECTION_FULL_VIEWPORT")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+    })
 }
 
 /// CSSOM snapshot and completeness flag. Non-geometric reads can resolve only
