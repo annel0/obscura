@@ -2868,6 +2868,19 @@ impl Page {
         let mut quiet_since = started;
         let mut content = self.js.as_ref().map_or(0, |js| js.content_generation());
         let mut content_quiet_since = started;
+        // A loaded document that ran no script and waits on no timer or
+        // request cannot change any more: the quiet period would be idle.
+        if self.pending_load.is_none() {
+            if let Some(js) = self.js.as_mut() {
+                if !js.has_started_scripts()
+                    && !js.has_pending_network_requests()
+                    && !js.has_pending_timers()
+                    && !js.has_pending_dynamic_scripts()
+                {
+                    return ContentSettle { settled: true, load_fired: true, elapsed: started.elapsed() };
+                }
+            }
+        }
         loop {
             if self.pending_load.is_some() {
                 self.step_pending_load();
@@ -9495,6 +9508,31 @@ mod tests {
                 .unwrap(),
             serde_json::json!("lazy-ready"),
             "an explicit caller settle must drive the lazy module graph",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_settle_of_a_scriptless_page_is_immediate() {
+        let mut page = import_map_test_page(
+            "scriptless-settle", "http://127.0.0.1:9", "<html><body><p>static</p></body></html>",
+        );
+        page.execute_scripts().await;
+        let started = std::time::Instant::now();
+        let settle = page.settle_content(super::SettlePolicy::default()).await;
+        assert!(settle.settled);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100), "{:?}", started.elapsed());
+
+        let mut page = import_map_test_page(
+            "timer-settle",
+            "http://127.0.0.1:9",
+            "<html><body><p>first</p><script>setTimeout(() => { document.querySelector('p').textContent = 'later'; }, 100);</script></body></html>",
+        );
+        page.execute_scripts().await;
+        let settle = page.settle_content(super::SettlePolicy::default()).await;
+        assert!(settle.settled);
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("document.querySelector('p').textContent").unwrap(),
+            serde_json::json!("later"),
         );
     }
 

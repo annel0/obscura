@@ -3608,6 +3608,16 @@ impl ObscuraJsRuntime {
             > 0
     }
 
+    /// Whether a setTimeout/setInterval callback is still due.
+    pub fn has_pending_timers(&mut self) -> bool {
+        self.next_pending_timeout_delay_ms().is_some()
+    }
+
+    /// Whether any script of the current document has started.
+    pub fn has_started_scripts(&self) -> bool {
+        !self.state.borrow().already_started_scripts.borrow().is_empty()
+    }
+
     fn next_pending_timeout_delay_ms(&mut self) -> Option<f64> {
         self.evaluate("globalThis.__obscura_nextPendingTimeoutDelay?.() ?? -1")
         .ok()
