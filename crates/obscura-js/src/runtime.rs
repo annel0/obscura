@@ -6734,6 +6734,24 @@ mod tests {
     }
 
     #[test]
+    fn token_lists_take_strings_and_character_data_has_element_siblings() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe><a id=a href=x>x</a><!--marker--><div id=d></div></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            'use strict';
+            const $ = id => document.getElementById(id);
+            $('f').sandbox = 'allow-scripts';
+            $('d').classList = 'x y';
+            $('a').relList = 'noopener';
+            $('d').relList = 'kept';
+            const marker = $('a').nextSibling;
+            return [$('f').getAttribute('sandbox'), $('d').className, $('a').getAttribute('rel'),
+                $('d').relList, $('d').hasAttribute('rel'), marker.nodeType,
+                marker.nextElementSibling.id, marker.previousElementSibling.id];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["allow-scripts", "x y", "noopener", "kept", false, 8, "d", "a"]));
+    }
+
+    #[test]
     fn canvas_2d_methods_live_on_the_interface_prototype() {
         let mut rt = setup_runtime("<html><body><canvas id=c width=10 height=10></canvas></body></html>");
         let result = rt.evaluate(r#"(function() {

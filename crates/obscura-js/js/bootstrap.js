@@ -2436,6 +2436,15 @@ function _isDomNode(value) {
       && (typeof value._nid === "number" || value._documentShim === true));
 }
 
+// A token list's [PutForwards=value] setter: the attribute when the element
+// has the list, an ordinary own property when it does not.
+function _putForwardTokens(element, property, attribute, value) {
+  if (element[property] !== undefined) {
+    element.setAttribute(attribute, String(value));
+  } else {
+    Object.defineProperty(element, property, { value, writable: true, configurable: true, enumerable: true });
+  }
+}
 function _requireNodeArgument(value, method, position, iface = "Node") {
   if (!_isDomNode(value)) {
     throw new TypeError(
@@ -3079,6 +3088,11 @@ class Node {
   }
 }
 class CharacterData extends Node {
+  // NonDocumentTypeChildNode: text and comments have element siblings too.
+  // Lit's hydration finds an element from its <!--lit-node--> marker this
+  // way, and threw on every MDN page without them.
+  get nextElementSibling() { let s = this.nextSibling; while (s && s.nodeType !== 1) s = s.nextSibling; return s; }
+  get previousElementSibling() { let s = this.previousSibling; while (s && s.nodeType !== 1) s = s.previousSibling; return s; }
   get data() {
     return _domParse("text_content", this._nid) ?? "";
   }
@@ -4198,6 +4212,11 @@ class Element extends Node {
     if (!this._classList) this._classList = new DOMTokenList(this, "class");
     return this._classList;
   }
+  // The token lists are [PutForwards=value]: a string assigned to one sets
+  // the attribute. Getter-only, they threw in strict code (MDN assigns
+  // iframe.sandbox). Where an element has no such list, the assignment
+  // makes an ordinary own property, as it would in a browser.
+  set classList(value) { this.setAttribute("class", String(value)); }
   get relList() {
     const ns = this.namespaceURI, ln = this.localName;
     const ok = (ns === "http://www.w3.org/2000/svg" && ln === "a") ||
@@ -4210,16 +4229,19 @@ class Element extends Node {
     if (!this._relList) this._relList = new DOMTokenList(this, "rel", ["alternate","dns-prefetch","icon","manifest","modulepreload","next","pingback","preconnect","prefetch","preload","prev","search","stylesheet"]);
     return this._relList;
   }
+  set relList(value) { _putForwardTokens(this, "relList", "rel", value); }
   get sandbox() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "iframe") return undefined;
     if (!this._sandboxList) this._sandboxList = new DOMTokenList(this, "sandbox", ["allow-downloads","allow-forms","allow-modals","allow-orientation-lock","allow-pointer-lock","allow-popups","allow-popups-to-escape-sandbox","allow-presentation","allow-same-origin","allow-scripts","allow-top-navigation","allow-top-navigation-by-user-activation","allow-top-navigation-to-custom-protocols"]);
     return this._sandboxList;
   }
+  set sandbox(value) { _putForwardTokens(this, "sandbox", "sandbox", value); }
   get sizes() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "link") return undefined;
     if (!this._sizesList) this._sizesList = new DOMTokenList(this, "sizes");
     return this._sizesList;
   }
+  set sizes(value) { _putForwardTokens(this, "sizes", "sizes", value); }
   get htmlFor() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
     const ln = this.localName;
