@@ -1278,6 +1278,10 @@ impl ObscuraJsRuntime {
         gs.content_generation = 0;
         // A document's blob: URLs go with it.
         gs.blob_sources.clear();
+        #[cfg(feature = "render")]
+        {
+            gs.layout_spent = std::time::Duration::ZERO;
+        }
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.page_in_flight_same_site = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
@@ -10121,6 +10125,28 @@ mod tests {
         })()"#).unwrap(), serde_json::json!([
             "rgb(255, 0, 0)", "rgb(0, 0, 255)", "inline", "rgb(0, 128, 0)"
         ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn layout_reads_over_budget_get_the_last_tree() {
+        let read = r#"(() => {
+            const box = document.getElementById('box');
+            const before = box.getBoundingClientRect().width;
+            box.style.width = '160px';
+            return [before, box.getBoundingClientRect().width];
+        })()"#;
+        let html = r#"<!doctype html><body style="margin:0"><div id=box style="width:80px;height:10px"></div></body>"#;
+        let mut rt = setup_runtime(html);
+        rt.set_viewport(400.0, 200.0);
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!([80, 160]));
+
+        crate::ops::LAYOUT_BUDGET_FOR_TEST.with(|budget| budget.set(Some(std::time::Duration::ZERO)));
+        let mut rt = setup_runtime(html);
+        rt.set_viewport(400.0, 200.0);
+        let result = rt.evaluate(read).unwrap();
+        crate::ops::LAYOUT_BUDGET_FOR_TEST.with(|budget| budget.set(None));
+        assert_eq!(result, serde_json::json!([80, 80]), "a spent budget answers from the last tree");
     }
 
     #[cfg(feature = "render")]

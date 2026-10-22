@@ -538,6 +538,10 @@ pub struct ObscuraState {
     /// against.
     #[cfg(feature = "render")]
     pub(crate) style_read_stylesheets: obscura_render::StylesheetCache,
+    /// Time this document has spent rebuilding its render tree, held against
+    /// OBSCURA_LAYOUT_BUDGET_MS.
+    #[cfg(feature = "render")]
+    pub(crate) layout_spent: std::time::Duration,
     /// Script-created faces in this document's `FontFaceSet`. This is separate
     /// from the DOM so the bridge does not manufacture a selector-visible
     /// `<style>` element merely to feed the renderer.
@@ -747,6 +751,8 @@ impl ObscuraState {
             style_query_cache: None,
             #[cfg(feature = "render")]
             style_read_stylesheets: obscura_render::StylesheetCache::default(),
+            #[cfg(feature = "render")]
+            layout_spent: std::time::Duration::ZERO,
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
             blob_sources: HashMap::new(),
@@ -8345,6 +8351,33 @@ pub(crate) fn ensure_prepared_render(
     ensure_prepared_render_with_base_url(state, base_url)
 }
 
+/// OBSCURA_LAYOUT_BUDGET_MS: once a document has spent this long rebuilding
+/// its render tree, layout reads are answered from the last tree instead of
+/// a fresh one. A page that interleaves DOM writes with geometry reads (an
+/// animation library setting up hundreds of elements) lays out again for
+/// each, a quarter second apiece on a big page: webflow.com spent 23 s of a
+/// render that way. Unset: no limit.
+#[cfg(all(test, feature = "render"))]
+thread_local! {
+    /// Lets a test set the layout budget for its own thread.
+    pub(crate) static LAYOUT_BUDGET_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "render")]
+fn layout_budget() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if let Some(budget) = LAYOUT_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        return Some(budget);
+    }
+    static BUDGET: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("OBSCURA_LAYOUT_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+    })
+}
+
 #[cfg(feature = "render")]
 fn ensure_prepared_render_with_base_url(
     state: &mut ObscuraState,
@@ -8359,6 +8392,15 @@ fn ensure_prepared_render_with_base_url(
     let needs_rebuild = state.prepared_render.as_ref().map_or(true, |prepared| {
         incompatible || prepared.animation_sample() != animation_sample
     }) || !state.pending_style_mutations.is_empty();
+    // Over budget, a tree that still fits the viewport and base answers for
+    // the document; what changed since stays queued.
+    if needs_rebuild
+        && !incompatible
+        && state.prepared_render.is_some()
+        && layout_budget().is_some_and(|budget| state.layout_spent >= budget)
+    {
+        return state.prepared_render.as_ref();
+    }
     if needs_rebuild {
         let rebuild_started = std::time::Instant::now();
         let retained = state.prepared_render.is_some() && !incompatible;
@@ -8432,6 +8474,7 @@ fn ensure_prepared_render_with_base_url(
         }
         state.prepared_render = Some(prepared);
         state.resolved_scroll = None;
+        state.layout_spent += rebuild_started.elapsed();
         tracing::debug!(
             target: "obscura_js::layout",
             ms = rebuild_started.elapsed().as_micros() as f64 / 1000.0,
