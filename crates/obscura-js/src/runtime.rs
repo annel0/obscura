@@ -6490,6 +6490,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn permission_status_is_an_event_target() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "permission-status",
+            r#"
+                navigator.permissions.query({ name: "geolocation" }).then(status => {
+                    let heard = 0;
+                    const listener = () => { heard++; };
+                    status.addEventListener("change", listener);
+                    status.dispatchEvent(new Event("change"));
+                    status.removeEventListener("change", listener);
+                    status.dispatchEvent(new Event("change"));
+                    globalThis.__permission = [
+                        String(status), status.state, status.name, status instanceof EventTarget,
+                        status instanceof PermissionStatus, heard,
+                    ];
+                });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(1_000).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__permission").unwrap(),
+            serde_json::json!(["[object PermissionStatus]", "prompt", "geolocation", true, true, 1]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn broadcast_channel_delivers_independent_post_time_clones_to_matching_peers() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(

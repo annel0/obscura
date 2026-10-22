@@ -8148,9 +8148,9 @@ globalThis.navigator = {
     var n = params && params.name;
     // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
     // returning "granted" for camera/microphone is a bot tell.
-    if (n === 'notifications') return Promise.resolve({state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null});
-    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
-    return Promise.resolve({state: 'granted', onchange: null});
+    if (n === 'notifications') return Promise.resolve(_permissionStatus(n, (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt'));
+    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve(_permissionStatus(n, 'prompt'));
+    return Promise.resolve(_permissionStatus(n, 'granted'));
   } },
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
@@ -17730,6 +17730,24 @@ if (typeof BroadcastChannel === 'undefined') {
   // EventTarget is currently Node-backed in this runtime; link the prototype
   // without invoking Node's DOM-node constructor or exposing a fake `_nid`.
   Object.setPrototypeOf(globalThis.BroadcastChannel.prototype, globalThis.EventTarget.prototype);
+}
+
+// What navigator.permissions.query() resolves to. Chrome's is an
+// EventTarget: VueUse's usePermission listens for its `change`, and a plain
+// object made that throw, which Nuxt turned into its 500 page.
+globalThis.PermissionStatus = class PermissionStatus {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get [Symbol.toStringTag]() { return 'PermissionStatus'; }
+};
+Object.setPrototypeOf(globalThis.PermissionStatus.prototype, globalThis.EventTarget.prototype);
+function _permissionStatus(name, state) {
+  const status = Object.create(globalThis.PermissionStatus.prototype);
+  Object.defineProperties(status, {
+    name: { value: String(name ?? ''), enumerable: true },
+    state: { value: state, enumerable: true },
+    onchange: { value: null, writable: true, enumerable: true },
+  });
+  return status;
 }
 
 globalThis.MediaQueryListEvent = class MediaQueryListEvent extends Event {
