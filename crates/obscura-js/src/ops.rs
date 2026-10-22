@@ -543,6 +543,10 @@ pub struct ObscuraState {
     /// `<style>` element merely to feed the renderer.
     #[cfg(feature = "render")]
     pub dynamic_fonts: Vec<obscura_render::DynamicFontFace>,
+    /// The text of the `blob:` URLs the page minted with
+    /// URL.createObjectURL, for the module loader: import(blobURL) is how
+    /// import-map polyfills load the modules they rewrite.
+    pub blob_sources: HashMap<String, String>,
     /// Live Canvas2D backing stores keyed by stable DOM identity. Pixel damage
     /// updates this resource independently of retained style/layout geometry.
     #[cfg(feature = "render")]
@@ -745,6 +749,7 @@ impl ObscuraState {
             style_read_stylesheets: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
+            blob_sources: HashMap::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
@@ -2098,6 +2103,20 @@ fn op_stylesheet_generation(state: &OpState, frame_id: u32, linked: bool) -> f64
             state.dom.as_ref().map_or(0, |dom| dom.external_stylesheet_generation()))
     };
     generation as f64
+}
+
+/// Keeps a `blob:` URL's text where the module loader can read it. Blob URLs
+/// belong to the page whichever realm minted them.
+#[op2(fast)]
+fn op_blob_register(state: &OpState, #[string] url: &str, #[string] text: &str) {
+    let shared = state.borrow::<SharedState>().clone();
+    shared.borrow_mut().blob_sources.insert(url.to_string(), text.to_string());
+}
+
+#[op2(fast)]
+fn op_blob_revoke(state: &OpState, #[string] url: &str) {
+    let shared = state.borrow::<SharedState>().clone();
+    shared.borrow_mut().blob_sources.remove(url);
 }
 
 #[op2(fast)]
@@ -7981,6 +8000,8 @@ pub fn build_extension() -> Extension {
         op_external_stylesheet_get(),
         op_stylesheet_generation(),
         op_cssom_stylesheet_has(),
+        op_blob_register(),
+        op_blob_revoke(),
         op_cssom_stylesheet_update(),
         op_cssom_stylesheet_clear(),
         op_runtime_events_enabled(),

@@ -284,6 +284,22 @@ impl ModuleLoader for ObscuraModuleLoader {
         options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
+        // A blob: URL the page minted holds the module's text; nothing to fetch.
+        if module_specifier.scheme() == "blob" {
+            let source = self.page_state.as_ref().and_then(Weak::upgrade).and_then(|state| {
+                state.try_borrow().ok().and_then(|state| state.blob_sources.get(&url).cloned())
+            });
+            self.loaded_specifiers.borrow_mut().push(url.clone());
+            return ModuleLoadResponse::Sync(match source {
+                Some(code) => Ok(ModuleSource::new(
+                    deno_core::ModuleType::JavaScript,
+                    ModuleSourceCode::String(code.into()),
+                    module_specifier,
+                    None,
+                )),
+                None => Err(io_err(format!("Failed to fetch module {url}: no such blob"))),
+            });
+        }
         // Module-graph CORS and same-origin credentials are relative to the
         // owning document, not to the importing module. The importer remains
         // the HTTP referrer for a dependency; keeping these URLs distinct

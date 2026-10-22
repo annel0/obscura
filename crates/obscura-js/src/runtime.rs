@@ -1276,6 +1276,8 @@ impl ObscuraJsRuntime {
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
         gs.content_generation = 0;
+        // A document's blob: URLs go with it.
+        gs.blob_sources.clear();
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.page_in_flight_same_site = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
@@ -6490,6 +6492,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn import_of_a_blob_url_runs_its_module() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "https://example.test/blob-import.js",
+            r#"
+                const url = URL.createObjectURL(new Blob(["export const answer = 42;"], { type: "text/javascript" }));
+                const revoked = URL.createObjectURL(new Blob(["export const answer = 1;"]));
+                URL.revokeObjectURL(revoked);
+                Promise.all([
+                    import(url).then(module => module.answer),
+                    import(revoked).then(() => "loaded", () => "failed"),
+                ]).then(results => { globalThis.__blob = results; }, error => { globalThis.__blob = String(error); });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(1_000).await.unwrap();
+        assert_eq!(rt.evaluate("globalThis.__blob").unwrap(), serde_json::json!([42, "failed"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn permission_status_is_an_event_target() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -6680,6 +6702,24 @@ mod tests {
         })()"#).unwrap();
         assert_eq!(result, serde_json::json!([3, 4, 7, true, true, true, [],
             "[object PerformanceMeasure]", 0, 0, -6, -1]));
+    }
+
+    #[test]
+    fn script_elements_report_the_script_types_they_support() {
+        let mut rt = setup_runtime("<html><head><script id=s>1</script></head><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const parsed = document.getElementById('s');
+            const created = document.createElement('script');
+            return [HTMLScriptElement.supports.name, HTMLScriptElement.supports('importmap'),
+                HTMLScriptElement.supports('module'), HTMLScriptElement.supports('classic'),
+                HTMLScriptElement.supports('speculationrules'),
+                parsed instanceof HTMLScriptElement, created instanceof HTMLScriptElement,
+                document.body instanceof HTMLScriptElement, created instanceof Element,
+                typeof Element.supports,
+                (created.src = 'x.js', [created.getAttribute('src'), created.src.endsWith('/x.js')])];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "supports", true, true, true, false, true, true, false, true, "undefined", ["x.js", true]]));
     }
 
     #[test]

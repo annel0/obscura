@@ -7653,6 +7653,10 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLIFrameElement;
   }
+  if (tag === "SCRIPT" && globalThis.HTMLScriptElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis.HTMLScriptElement;
+  }
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -7679,6 +7683,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (localName === "li") return HTMLLIElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
+    if (tag === "SCRIPT" && globalThis.HTMLScriptElement) return globalThis.HTMLScriptElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -14207,7 +14212,14 @@ globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {
 };
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
-globalThis.HTMLScriptElement = Element;
+// <script> has its own brand for HTMLScriptElement.supports(), which import
+// map polyfills (es-module-shims, remix's) read to learn that import maps
+// work natively; without it remix.run threw before rendering anything.
+globalThis.HTMLScriptElement = class HTMLScriptElement extends Element {
+  static supports(type) {
+    return type === 'classic' || type === 'module' || type === 'importmap';
+  }
+};
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
 globalThis.HTMLMetaElement = class HTMLMetaElement extends Element {
@@ -16748,20 +16760,26 @@ URL.createObjectURL = function(blob) {
     // failed (net::ERR_FAILED), which broke AWS WAF's proof-of-work worker.
     // The obscura Blob materializes _bytes in its constructor; fall back to
     // the async text() store only for foreign Blob shims without _bytes.
+    // The module loader reads blob: modules from the native side.
+    const keep = (text) => {
+      globalThis.__blobStore[id] = text;
+      if (typeof __obscuraCore.ops.op_blob_register === 'function') __obscuraCore.ops.op_blob_register(id, text);
+    };
     if (blob._bytes) {
       let text = '';
       try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
-      globalThis.__blobStore[id] = text;
+      keep(text);
     } else if (typeof blob.text === 'function') {
-      blob.text().then(text => { globalThis.__blobStore[id] = text; });
+      blob.text().then(keep);
     } else {
-      globalThis.__blobStore[id] = '';
+      keep('');
     }
     return id;
   }
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
+  if (typeof __obscuraCore.ops.op_blob_revoke === 'function') __obscuraCore.ops.op_blob_revoke(String(url));
 };
 
 // Window-level scrolling (issue #468). #431 gave elements functional
