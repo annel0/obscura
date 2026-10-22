@@ -5970,6 +5970,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn workers_import_blob_and_data_scripts() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("https://example.test/worker-imports.js", r#"
+            const helper = URL.createObjectURL(new Blob(['self.fromBlob = 2;'], { type: 'text/javascript' }));
+            const source = `
+                importScripts(${JSON.stringify(helper)}, 'data:text/javascript,self.fromData%20%3D%203%3B');
+                let missing = 'none';
+                try { importScripts('https://example.test/never-fetched.js'); } catch (error) { missing = error.name; }
+                onmessage = () => postMessage([fromBlob, fromData, missing]);
+            `;
+            const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+            worker.onmessage = event => { globalThis.__imports = event.data; };
+            worker.postMessage('go');
+        "#).unwrap();
+        rt.run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(rt.evaluate("globalThis.__imports").unwrap(), serde_json::json!([2, 3, "NetworkError"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_onmessage_bindings_do_not_mutate_window() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script("worker-onmessage-bindings", r#"

@@ -16743,8 +16743,9 @@ globalThis.Worker = class Worker {
       const blob = globalThis.__blobStore?.[url];
       if (blob) {
         worker._code = blob;
+        worker._base = globalThis.location?.href || '';
         // Auto-start on next tick so caller can set onmessage first.
-        setTimeout(() => worker._autoRun(), 0);
+        setTimeout(() => worker._prefetchImports().then(() => worker._autoRun()), 0);
         return;
       }
       // Resolve relative URLs against the current page.
@@ -16755,14 +16756,54 @@ globalThis.Worker = class Worker {
         try {
           const resp = await fetch(resolvedUrl);
           worker._code = await resp.text();
+          worker._base = resolvedUrl;
+          await worker._prefetchImports();
           if (!worker._terminated) worker._autoRun();
         } catch(e) { if (worker.onerror) worker.onerror(e); }
       })();
     }
   }
+  // importScripts() is synchronous and this worker runs in the page's
+  // event loop, so the scripts a worker names as string literals are
+  // fetched before it starts; blob: and data: URLs need no fetch. Any other
+  // URL fails as a network error would.
+  async _prefetchImports() {
+    this._imports = new Map();
+    const pattern = /importScripts\s*\(([^)]*)\)/g;
+    const urls = new Set();
+    for (const call of String(this._code || '').matchAll(pattern)) {
+      for (const literal of call[1].matchAll(/(["'`])([^"'`]+)\1/g)) urls.add(literal[2]);
+    }
+    await Promise.all([...urls].map(async (raw) => {
+      let url;
+      try { url = new URL(raw, this._base || undefined).href; } catch (e) { return; }
+      if (url.startsWith('blob:') || url.startsWith('data:')) return;
+      try {
+        const response = await fetch(url);
+        if (response.ok) this._imports.set(url, await response.text());
+      } catch (e) {}
+    }));
+  }
+  _importScripts(scope, urls) {
+    const run = new Function('scope', 'source', 'with (scope) { eval(source); }');
+    for (const raw of urls) {
+      let url;
+      try { url = new URL(String(raw), this._base || undefined).href; }
+      catch (e) { throw new DOMException("Failed to execute 'importScripts': The URL '" + raw + "' is invalid.", 'SyntaxError'); }
+      let source;
+      if (url.startsWith('blob:')) source = globalThis.__blobStore?.[url];
+      else if (url.startsWith('data:')) { try { source = _decodeDataScriptUrl(url); } catch (e) {} }
+      else source = this._imports?.get(url);
+      if (source === undefined) {
+        throw new DOMException("Failed to execute 'importScripts': The script at '" + url + "' failed to load.", 'NetworkError');
+      }
+      run.call(scope, scope, source);
+    }
+  }
   _makeScope() {
     const worker = this;
     const scope = {
+      importScripts: (...urls) => worker._importScripts(scope, urls),
       onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
