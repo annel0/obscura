@@ -12,4 +12,11 @@ pub enum InterceptAction {
 #[async_trait::async_trait]
 pub trait RequestInterceptor {
     async fn intercept(&self, request: &RequestInfo) -> InterceptAction;
+
+    /// Whether this interceptor only ever acts on document requests. The
+    /// shared subresource cache, off while any other interceptor is
+    /// installed, then stays on: documents are never cached anyway.
+    fn documents_only(&self) -> bool {
+        false
+    }
 }

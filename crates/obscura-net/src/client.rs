@@ -1360,7 +1360,7 @@ impl ObscuraHttpClient {
             || body.is_some()
             || request.resource_type == ResourceType::Document
             || !matches!(url.scheme(), "http" | "https")
-            || self.interceptor.read().await.is_some()
+            || self.interceptor.read().await.as_ref().is_some_and(|interceptor| !interceptor.documents_only())
         {
             return None;
         }
