@@ -7657,6 +7657,10 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLScriptElement;
   }
+  if (typeof _valueElementClasses !== "undefined" && _valueElementClasses[tag]
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis[_valueElementClasses[tag]];
+  }
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -7684,6 +7688,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
     if (tag === "SCRIPT" && globalThis.HTMLScriptElement) return globalThis.HTMLScriptElement;
+    if (typeof _valueElementClasses !== "undefined" && _valueElementClasses[tag]) return globalThis[_valueElementClasses[tag]];
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -14328,6 +14333,32 @@ globalThis.HTMLFieldSetElement = Element;
 globalThis.HTMLLegendElement = Element;
 globalThis.HTMLProgressElement = Element;
 globalThis.HTMLDetailsElement = Element;
+// `value` belongs to form controls and a few value-bearing elements, not to
+// every element: libraries tell a node from a ref object by
+// `"value" in el || "current" in el` (egjs, under Flicking carousels), and
+// with `value` on Element every <div> looked like a ref holding nothing,
+// which emptied drom.ru's home page. Elements that have it get their brand.
+{
+  const valueDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'value');
+  const brand = (name) => {
+    const cls = { [name]: class extends Element {} }[name];
+    Object.defineProperty(cls.prototype, 'value', valueDescriptor);
+    return cls;
+  };
+  for (const name of ['HTMLButtonElement', 'HTMLSelectElement', 'HTMLOptionElement', 'HTMLProgressElement',
+    'HTMLMeterElement', 'HTMLOutputElement', 'HTMLDataElement']) {
+    globalThis[name] = brand(name);
+  }
+  Object.defineProperty(HTMLTextAreaElement.prototype, 'value', valueDescriptor);
+  // <li> already reflects its integer value.
+  delete Element.prototype.value;
+}
+// Tag names whose elements carry `value` through the brands above.
+var _valueElementClasses = {
+  BUTTON: 'HTMLButtonElement', SELECT: 'HTMLSelectElement', OPTION: 'HTMLOptionElement',
+  PROGRESS: 'HTMLProgressElement', METER: 'HTMLMeterElement', OUTPUT: 'HTMLOutputElement',
+  DATA: 'HTMLDataElement',
+};
 globalThis.HTMLDialogElement = Element;
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and

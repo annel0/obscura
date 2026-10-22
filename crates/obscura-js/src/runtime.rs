@@ -6709,6 +6709,25 @@ mod tests {
     }
 
     #[test]
+    fn only_value_bearing_elements_have_a_value() {
+        let mut rt = setup_runtime(r#"<html><body><div id=d></div>
+            <select id=s><option value=a>A</option><option value=b selected>B</option></select>
+            <button id=b value=go>Go</button><ol><li id=l value=7>x</li></ol>
+            <textarea id=t>text</textarea><input id=i value=v></body></html>"#);
+        let result = rt.evaluate(r#"(function() {
+            const $ = id => document.getElementById(id);
+            const has = el => 'value' in el;
+            return [has($('d')), has(document.createElement('span')), has(document.createElement('a')),
+                $('s').value, $('b').value, $('l').value, $('t').value, $('i').value,
+                document.createElement('option') instanceof HTMLOptionElement,
+                $('d') instanceof HTMLButtonElement, $('b') instanceof HTMLButtonElement,
+                new Option('x', 'y').value];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            false, false, false, "b", "go", 7, "text", "v", true, false, true, "y"]));
+    }
+
+    #[test]
     fn event_handler_properties_survive_a_frozen_element_prototype() {
         let mut rt = setup_runtime("<html><body><button id=b>go</button></body></html>");
         let result = rt.evaluate(r#"(function() {
