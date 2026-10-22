@@ -626,6 +626,12 @@ pub fn connect_timeout() -> Duration {
 /// navigation reset its unfinished streams on the same connection. Over
 /// HTTP/1.1 the same ten-page run had every request answered, and finished
 /// faster than with a fresh context per page.
+/// `OBSCURA_INSECURE_TLS=1` accepts any certificate, for a staging site on
+/// a self-signed one. Off by default.
+pub fn accept_invalid_certs() -> bool {
+    std::env::var("OBSCURA_INSECURE_TLS").is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
 pub fn http2_enabled() -> bool {
     std::env::var("OBSCURA_HTTP2").is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
 }
@@ -1238,7 +1244,7 @@ impl ObscuraHttpClient {
                 .redirect(Policy::none())
                 .timeout(self.timeout)
                 .connect_timeout(connect_timeout())
-                .danger_accept_invalid_certs(false)
+                .danger_accept_invalid_certs(accept_invalid_certs())
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.
                 .http1_allow_obsolete_multiline_headers_in_responses(true)
