@@ -440,6 +440,10 @@ pub struct ObscuraState {
     /// The browser settle policy samples this to distinguish useful deferred
     /// rendering work from unrelated long-lived timers.
     pub activity_generation: u64,
+    /// The part of `activity_generation` that changes what the document
+    /// says: nodes, text and attributes other than presentation state.
+    /// Animation and transition frames write only style and class.
+    pub content_generation: u64,
     /// Monotonic identity of the currently installed document. Async resource
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
@@ -691,6 +695,7 @@ impl ObscuraState {
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             page_in_flight_same_site: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
+            content_generation: 0,
             document_generation: 0,
             base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
@@ -1391,6 +1396,23 @@ fn shadow_including_connected_nodes(dom: &DomTree) -> HashSet<NodeId> {
 /// changes the rendered document. Chromium dirties layout when the mutation
 /// reaches a connected style/layout owner, not merely because a mutating API
 /// was entered.
+/// Whether a DOM write can change what the document says rather than how it
+/// looks: style, class, `data-*` and `aria-*` attributes and form state are
+/// what animations, transitions and widgets rewrite frame after frame.
+fn mutation_changes_content(cmd: &str, arg2: &str) -> bool {
+    let attribute = match cmd {
+        "set_form_value" | "set_form_checked" | "set_form_indeterminate" => return false,
+        "set_attribute" | "remove_attribute" => arg2.split('\0').next().unwrap_or(arg2),
+        "set_attribute_ns" => arg2.split('\0').nth(1).unwrap_or(""),
+        "remove_attribute_ns" => arg2.split_once('\0').map_or(arg2, |(_, local)| local),
+        _ => return true,
+    };
+    let attribute = attribute.rsplit(':').next().unwrap_or(attribute).to_ascii_lowercase();
+    !(matches!(attribute.as_str(), "style" | "class")
+        || attribute.starts_with("data-")
+        || attribute.starts_with("aria-"))
+}
+
 fn render_mutation_impact(
     dom: &DomTree,
     cmd: &str,
@@ -2288,6 +2310,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         let invalidate = impact.connected && impact.actual_change;
         if invalidate {
             state.activity_generation = state.activity_generation.wrapping_add(1);
+            if mutation_changes_content(&cmd, &arg2) {
+                state.content_generation = state.content_generation.wrapping_add(1);
+            }
         }
         #[cfg(feature = "render")]
         // Native text values and indeterminate checkbox marks are consumed

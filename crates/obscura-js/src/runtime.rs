@@ -1275,6 +1275,7 @@ impl ObscuraJsRuntime {
         gs.dom = Some(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
+        gs.content_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.page_in_flight_same_site = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
@@ -3566,6 +3567,13 @@ impl ObscuraJsRuntime {
     /// screenshot or DOM dump.
     pub fn activity_generation(&self) -> u64 {
         self.state.borrow().activity_generation
+    }
+
+    /// Generation of the connected-document mutations that change content:
+    /// `activity_generation` without style, class, `data-*`, `aria-*` and
+    /// form-state writes.
+    pub fn content_generation(&self) -> u64 {
+        self.state.borrow().content_generation
     }
 
     /// Whether a fetch()/XHR or dynamic script request the page started is

@@ -423,6 +423,11 @@ pub struct SettlePolicy {
     /// How long third-party requests and dynamic scripts in flight hold the
     /// wait. fetch()/XHR to the page's own site holds it until `budget`.
     pub grace: std::time::Duration,
+    /// Settle once the content (nodes, text, attributes other than style,
+    /// class, `data-*` and `aria-*`) has been still this long, however busy
+    /// animations keep the rest of the document. `None` waits for all DOM
+    /// activity to stop.
+    pub content_quiet: Option<std::time::Duration>,
 }
 
 impl Default for SettlePolicy {
@@ -432,6 +437,7 @@ impl Default for SettlePolicy {
             quiet: std::time::Duration::from_millis(500),
             quiet_after_load: std::time::Duration::from_millis(200),
             grace: std::time::Duration::from_secs(1),
+            content_quiet: None,
         }
     }
 }
@@ -2860,6 +2866,8 @@ impl Page {
         let grace_until = started + policy.grace;
         let mut generation = self.js.as_ref().map_or(0, |js| js.activity_generation());
         let mut quiet_since = started;
+        let mut content = self.js.as_ref().map_or(0, |js| js.content_generation());
+        let mut content_quiet_since = started;
         loop {
             if self.pending_load.is_some() {
                 self.step_pending_load();
@@ -2874,6 +2882,11 @@ impl Page {
                 generation = current;
                 quiet_since = now;
             }
+            let current = js.content_generation();
+            if current != content {
+                content = current;
+                content_quiet_since = now;
+            }
             // Once `load` has fired the page considers itself loaded, so only
             // its own data requests and lazy code still hold the wait: a
             // route's chunk still loading renders the content when it lands.
@@ -2883,7 +2896,10 @@ impl Page {
                     && now < grace_until
                     && (js.has_pending_network_requests() || js.has_pending_dynamic_scripts()));
             let quiet = if load_fired { policy.quiet_after_load } else { policy.quiet };
-            if !network && now.duration_since(quiet_since) >= quiet {
+            let content_still = policy
+                .content_quiet
+                .is_some_and(|still| now.duration_since(content_quiet_since) >= quiet.max(still));
+            if !network && (now.duration_since(quiet_since) >= quiet || content_still) {
                 return ContentSettle {
                     settled: true,
                     load_fired: self.pending_load.is_none(),
@@ -9480,6 +9496,42 @@ mod tests {
             serde_json::json!("lazy-ready"),
             "an explicit caller settle must drive the lazy module graph",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_settle_ends_once_only_animation_frames_keep_writing() {
+        let html = r#"<html><body><main>first</main><div id=spinner></div><script>
+            setTimeout(() => { document.querySelector('main').textContent = 'loaded'; }, 300);
+            let turn = 0;
+            setInterval(() => {
+                const spinner = document.getElementById('spinner');
+                spinner.style.transform = `rotate(${++turn}deg)`;
+                spinner.className = turn % 2 ? 'odd' : 'even';
+                spinner.setAttribute('data-turn', String(turn));
+            }, 30);
+        </script></body></html>"#;
+        let budget = std::time::Duration::from_secs(3);
+        let mut page = import_map_test_page("animation-settle", "http://127.0.0.1:9", html);
+        page.execute_scripts().await;
+        let started = std::time::Instant::now();
+        let settle = page
+            .settle_content(super::SettlePolicy {
+                budget,
+                content_quiet: Some(std::time::Duration::from_millis(500)),
+                ..super::SettlePolicy::default()
+            })
+            .await;
+        assert!(settle.settled, "the spinner held the wait for the whole budget");
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_500), "{:?}", started.elapsed());
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("document.querySelector('main').textContent").unwrap(),
+            serde_json::json!("loaded"),
+        );
+
+        let mut page = import_map_test_page("animation-no-content-quiet", "http://127.0.0.1:9", html);
+        page.execute_scripts().await;
+        let settle = page.settle_content(super::SettlePolicy { budget, ..super::SettlePolicy::default() }).await;
+        assert!(!settle.settled, "without content_quiet any activity holds the wait");
     }
 
     #[tokio::test(flavor = "current_thread")]
