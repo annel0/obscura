@@ -6496,6 +6496,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn import_from_code_without_a_url_resolves_against_the_document() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "undefined",
+            r#"
+                const url = URL.createObjectURL(new Blob(["export default 'lazy';"], { type: "text/javascript" }));
+                import(url).then(module => { globalThis.__lazy = module.default; }, error => { globalThis.__lazy = String(error); });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(1_000).await.unwrap();
+        assert_eq!(rt.evaluate("globalThis.__lazy").unwrap(), serde_json::json!("lazy"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn import_of_a_blob_url_runs_its_module() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(

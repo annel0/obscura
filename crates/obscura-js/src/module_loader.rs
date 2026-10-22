@@ -259,17 +259,23 @@ impl ModuleLoader for ObscuraModuleLoader {
                 .map_err(|error| io_err(error.to_string()));
         }
 
+        // A referrer that is no URL (code from eval or new Function names
+        // itself "undefined" or the like) resolves against the document, as
+        // a browser resolves import() without an active script: Shopify's
+        // storefront scripts failed every lazy import otherwise.
         let base = if referrer.is_empty()
             || referrer.starts_with('<')
             || referrer == "about:blank"
         {
-            &self.base_url
+            None
         } else {
-            referrer
+            ModuleSpecifier::parse(referrer).ok()
         };
-
-        let base = ModuleSpecifier::parse(base)
-            .map_err(|e| io_err(format!("Invalid module referrer {}: {}", base, e)))?;
+        let base = match base {
+            Some(base) => base,
+            None => ModuleSpecifier::parse(&self.base_url)
+                .map_err(|e| io_err(format!("Invalid module base {}: {}", self.base_url, e)))?,
+        };
         self.import_map
             .try_borrow_mut()
             .map_err(|_| io_err("Import map is already borrowed".to_string()))?
