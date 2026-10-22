@@ -332,6 +332,15 @@ pub struct Page {
     runtime_events_enabled: std::cell::Cell<bool>,
     console_messages_enabled: std::cell::Cell<bool>,
     pending_frame_work: std::collections::VecDeque<PendingFrameWork>,
+    /// Script downloads started during navigation, consumed by `execute_scripts`.
+    script_prefetch: Option<ScriptPrefetch>,
+    /// Load-phase work still running after navigation returned at
+    /// DOMContentLoaded; driven by `advance_pending_load` and the autonomous
+    /// event-loop turn.
+    pending_load: Option<PendingLoad>,
+    /// Set when a deferred load phase fires `load`, until the CDP layer takes
+    /// it to emit the load lifecycle events it held back.
+    deferred_load_fired: bool,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
@@ -355,6 +364,113 @@ pub struct Page {
 
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
+#[derive(Debug, Clone, Copy)]
+enum ScriptKind {
+    Classic,
+    Module,
+    ImportMap,
+}
+
+#[derive(Debug)]
+struct ScriptInfo {
+    src: Option<String>,
+    inline: String,
+    is_defer: bool,
+    is_async: bool,
+    kind: ScriptKind,
+    nid: u32,
+    /// Document base URL at this element's parser encounter point.
+    base_url: String,
+}
+
+/// Parser-discovered scripts with their external classic fetches already running.
+struct ScriptPrefetch {
+    scripts: Vec<ScriptInfo>,
+    /// Script indexes with a fetch in `fetches`.
+    planned: std::collections::HashSet<usize>,
+    fetches: tokio::task::JoinSet<(usize, Option<(String, obscura_net::Response)>)>,
+    /// Finished fetches, keyed by script index, not yet taken by execution.
+    ready: std::collections::HashMap<usize, (String, String, obscura_net::Response)>,
+    /// Indexes whose fetch finished, whether or not it produced a body.
+    finished: std::collections::HashSet<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test shorten the script deadline for its own thread instead of
+    /// setting OBSCURA_SCRIPT_DEADLINE_MS for every test in the process.
+    static SCRIPT_DEADLINE_FOR_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn script_deadline_override() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(ms) = SCRIPT_DEADLINE_FOR_TEST.with(std::cell::Cell::get) {
+        return Some(ms);
+    }
+    None
+}
+
+/// When `Page::settle_content` considers a page's content settled.
+#[derive(Debug, Clone, Copy)]
+pub struct SettlePolicy {
+    /// Upper bound for the whole wait.
+    pub budget: std::time::Duration,
+    /// DOM quiet required while `load` has not fired.
+    pub quiet: std::time::Duration,
+    /// DOM quiet required once `load` has fired and the page's own load work
+    /// is done.
+    pub quiet_after_load: std::time::Duration,
+    /// How long third-party requests and dynamic scripts in flight hold the
+    /// wait. fetch()/XHR to the page's own site holds it until `budget`.
+    pub grace: std::time::Duration,
+    /// Settle once the content (nodes, text, attributes other than style,
+    /// class, `data-*` and `aria-*`) has been still this long, however busy
+    /// animations keep the rest of the document. `None` waits for all DOM
+    /// activity to stop.
+    pub content_quiet: Option<std::time::Duration>,
+}
+
+impl Default for SettlePolicy {
+    fn default() -> Self {
+        Self {
+            budget: std::time::Duration::from_secs(5),
+            quiet: std::time::Duration::from_millis(500),
+            quiet_after_load: std::time::Duration::from_millis(200),
+            grace: std::time::Duration::from_secs(1),
+            content_quiet: None,
+        }
+    }
+}
+
+/// How `Page::settle_content` ended.
+#[derive(Debug, Clone, Copy)]
+pub struct ContentSettle {
+    /// The document went quiet; false means the budget ran out first.
+    pub settled: bool,
+    /// `load` had fired by the time the wait ended.
+    pub load_fired: bool,
+    pub elapsed: std::time::Duration,
+}
+
+/// What is left of the script phase once DOMContentLoaded has fired, kept when
+/// navigation returns at DOMContentLoaded instead of waiting for `load`: async
+/// scripts still downloading and the load event itself. Like a browser, the
+/// page stays readable and scriptable while this finishes.
+struct PendingLoad {
+    scripts: Vec<ScriptInfo>,
+    prefetch: ScriptPrefetch,
+    /// Async scripts that had not arrived when the parser reached them.
+    late_async: Vec<usize>,
+    /// Downloads that finished while a cancellable wait held the page.
+    joined: Vec<(usize, Option<(String, obscura_net::Response)>)>,
+    /// The script phase's deadline; `load` fires by then at the latest.
+    deadline: tokio::time::Instant,
+    started: std::time::Instant,
+    /// The last event-loop turn found nothing to do, so waits skip it until a
+    /// download lands and may have queued new work.
+    js_idle: bool,
+}
+
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
 
 /// The first navigation counts. The low default stops a page that resets
@@ -1146,6 +1262,9 @@ impl Page {
             runtime_events_enabled: std::cell::Cell::new(false),
             console_messages_enabled: std::cell::Cell::new(false),
             pending_frame_work: std::collections::VecDeque::new(),
+            script_prefetch: None,
+            pending_load: None,
+            deferred_load_fired: false,
             suspended_started_script_ids: Vec::new(),
             suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
             suspended_console_messages: Vec::new(),
@@ -2158,7 +2277,7 @@ impl Page {
     }
 
     async fn execute_scripts(&mut self) {
-        self.execute_scripts_with_module_budget(None).await;
+        self.execute_scripts_with_module_budget(None, false).await;
     }
 
     /// Drive a selected script queue until it empties or the shared parser
@@ -2238,62 +2357,105 @@ impl Page {
         .await
     }
 
-    async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
-        let scripts_started = std::time::Instant::now();
-        tracing::info!(
-            "execute_scripts called, js runtime exists: {}",
-            self.js.is_some()
-        );
-        // Soft deadline on the entire script-execution phase. Heavy SPAs
-        // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
-        // fetch + execute loop can blow past a Puppeteer/Playwright goto
-        // timeout. The old 10s default was too tight: a heavy React/Vue/Angular
-        // SPA had its remaining scripts skipped before the app booted, so it
-        // never fired its XHR/fetch calls and page.on('response') saw nothing
-        // (issue #361). Only pages that actually run past the deadline are
-        // affected; fast pages finish and return well before it, so a larger
-        // budget costs them nothing. 30s gives an app room to initialize while
-        // the per-phase watchdog (armed at this + 1s) still bounds a real
-        // synchronous hang. Raise it further with OBSCURA_SCRIPT_DEADLINE_MS=<ms>
-        // for very heavy SPAs on slow networks (pair it with a matching client
-        // navigation timeout).
-        let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30_000);
-        let script_deadline =
-            tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
-
-        // Hard backstop over the WHOLE script-execution phase. Inline scripts
-        // run back-to-back with no await between them, so neither the soft
-        // deadline above (only checked between scripts) nor the per-script guard
-        // can interrupt a page that burns the budget across many synchronous
-        // scripts (the real-world SPA / anti-bot busy-loop hang). This watchdog
-        // terminates the isolate if cumulative synchronous script work overruns.
-        let exec_wd = self
-            .js
-            .as_mut()
-            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(script_deadline_ms + 1000)));
-
-        #[derive(Debug, Clone, Copy)]
-        enum ScriptKind {
-            Classic,
-            Module,
-            ImportMap,
+    /// The fetched body of script `index`, waiting only for that script's own
+    /// download. Other downloads keep running while this one is awaited, and
+    /// their results are parked in `pending.ready` for later scripts.
+    ///
+    /// With `drive_event_loop` (a deferred script, after parsing) the page's
+    /// event loop runs meanwhile, as a browser spins it while it waits:
+    /// timers fire, fetches and dynamic imports complete. Without it a slow
+    /// deferred script (a tracker) froze the page's own lazy chunks until it
+    /// arrived or timed out.
+    async fn script_body(
+        &mut self,
+        pending: &mut ScriptPrefetch,
+        index: usize,
+        deadline: tokio::time::Instant,
+        drive_event_loop: bool,
+    ) -> Option<(String, String, obscura_net::Response)> {
+        enum Woke {
+            Fetched(Option<Result<(usize, Option<(String, obscura_net::Response)>), tokio::task::JoinError>>),
+            Deadline,
+            EventLoop,
         }
-
-        #[derive(Debug)]
-        struct ScriptInfo {
-            src: Option<String>,
-            inline: String,
-            is_defer: bool,
-            is_async: bool,
-            kind: ScriptKind,
-            nid: u32,
-            /// Document base URL at this element's parser encounter point.
-            base_url: String,
+        if !pending.planned.contains(&index) {
+            return None;
         }
+        while !pending.finished.contains(&index) {
+            let woke = {
+                let js = self.js.as_mut();
+                let drive = drive_event_loop && js.is_some();
+                tokio::select! {
+                    joined = tokio::time::timeout_at(deadline, pending.fetches.join_next()) => match joined {
+                        Ok(joined) => Woke::Fetched(joined),
+                        Err(_) => Woke::Deadline,
+                    },
+                    () = async {
+                        match js {
+                            Some(js) => {
+                                // A turn that finds nothing ready returns at
+                                // once; queued timers do not keep deno's loop
+                                // busy, so look again shortly rather than stop.
+                                if matches!(js.run_autonomous_event_loop_turn().await, Ok(true)) {
+                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                }
+                            }
+                            None => std::future::pending().await,
+                        }
+                    }, if drive => Woke::EventLoop,
+                }
+            };
+            match woke {
+                Woke::Fetched(Some(joined)) => {
+                    if let Ok(done) = joined {
+                        self.absorb_script_fetch(pending, done);
+                    }
+                }
+                Woke::Fetched(None) => break,
+                Woke::Deadline => {
+                    tracing::warn!(
+                        "execute_scripts: fetch deadline reached, some scripts may not have loaded"
+                    );
+                    return None;
+                }
+                Woke::EventLoop => {}
+            }
+        }
+        pending.ready.remove(&index)
+    }
 
+    /// Records a finished script download without waiting for the others.
+    fn absorb_script_fetch(
+        &mut self,
+        pending: &mut ScriptPrefetch,
+        (idx, result): (usize, Option<(String, obscura_net::Response)>),
+    ) {
+        pending.finished.insert(idx);
+        let Some((url, resp)) = result else { return };
+        if !script_response_is_executable(resp.status) {
+            self.record_network_event_with_body(
+                &url,
+                "GET",
+                "Script",
+                resp.status,
+                &resp.headers,
+                &resp.body,
+                false,
+            );
+            tracing::warn!("Refusing to execute script {} after HTTP {}", url, resp.status);
+            return;
+        }
+        // Script bodies: only the HTTP Content-Type charset matters
+        // (no in-band meta-charset for JS).
+        let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+        pending.ready.insert(idx, (url, code, resp));
+    }
+
+    /// Plans the parser-discovered scripts and starts fetching the external
+    /// classic ones as background tasks. Navigation calls this before the
+    /// stylesheet wave so script and stylesheet downloads overlap, as they do
+    /// in a browser; `execute_scripts` consumes the result.
+    fn start_script_fetches(&mut self) -> Option<ScriptPrefetch> {
         let all_scripts = match &self.js {
             Some(js) => {
                 let document_url = self.url_string();
@@ -2378,24 +2540,8 @@ impl Page {
                 })
                 .unwrap_or_default()
             }
-            None => return,
+            None => return None,
         };
-
-        // HTML scripts have an "already started" flag. Mark every
-        // parser-discovered script before running page code so React/Next
-        // hydration can move or hoist those nodes without appendChild
-        // executing them a second time.
-        if let Some(js) = &mut self.js {
-            let ids = all_scripts
-                .iter()
-                .map(|script| script.nid.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let _ = js.execute_script(
-                "<parser-scripts>",
-                &format!("globalThis.__markParserScripts([{}]);", ids),
-            );
-        }
 
         tracing::info!("Found {} parser-discovered scripts", all_scripts.len());
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
@@ -2496,52 +2642,373 @@ impl Page {
         // Bound concurrency: a page with 100 external scripts would
         // otherwise open 100 sockets at once, exhausting the connection
         // pool / ephemeral ports and triggering OS-level backpressure.
-        // 16 is well above the per-host pool ceiling most browsers use
-        // and matches what real Chrome does for a given origin.
-        use futures::StreamExt as _;
-        let fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
-        let fetch_results = match tokio::time::timeout_at(
-            script_deadline,
-            fetch_stream.collect::<Vec<_>>(),
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(_) => {
-                tracing::warn!(
-                    "execute_scripts: fetch deadline reached, some scripts may not have loaded"
-                );
-                Vec::new()
-            }
-        };
+        // 16 matches what real Chrome does for a given origin.
+        let permits = Arc::new(tokio::sync::Semaphore::new(16));
+        let mut fetches = tokio::task::JoinSet::new();
+        for ((idx, _), fetch) in fetch_tasks.iter().zip(fetch_futures) {
+            let permits = permits.clone();
+            let idx = *idx;
+            fetches.spawn(async move {
+                let _permit = permits.acquire_owned().await.ok();
+                (idx, fetch.await.map(|(_, url, resp)| (url, resp)))
+            });
+        }
+        Some(ScriptPrefetch {
+            scripts: all_scripts,
+            planned: fetch_tasks.iter().map(|(idx, _)| *idx).collect(),
+            fetches,
+            ready: std::collections::HashMap::new(),
+            finished: std::collections::HashSet::new(),
+        })
+    }
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
-            std::collections::HashMap::new();
-        for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
-                if !script_response_is_executable(resp.status) {
-                    self.record_network_event_with_body(
-                        &url,
-                        "GET",
-                        "Script",
-                        resp.status,
-                        &resp.headers,
-                        &resp.body,
-                        false,
+    /// Runs one parser-discovered classic script: the fetched body for an
+    /// external one (nothing if its download failed), the inline text otherwise.
+    fn execute_parser_classic(
+        &mut self,
+        script: &ScriptInfo,
+        fetched_script: Option<(String, String, obscura_net::Response)>,
+    ) {
+        if script.src.is_some() {
+            if let Some((url, code, resp)) = fetched_script {
+                tracing::info!("Executing script ({} bytes): {}", code.len(), url);
+                let execution_url = resp.url.to_string();
+                self.record_network_event_with_body(
+                    &url,
+                    "GET",
+                    "Script",
+                    resp.status,
+                    &resp.headers,
+                    &resp.body,
+                    false,
+                );
+                if let Some(js) = &mut self.js {
+                    let _ = js.execute_script(
+                        "<current-script>",
+                        &format!("globalThis.__currentScriptNid={};", script.nid),
                     );
-                    tracing::warn!(
-                        "Refusing to execute script {} after HTTP {}",
-                        url,
-                        resp.status
-                    );
-                    continue;
+                    if let Err(error) = js.execute_script_guarded(&execution_url, &code) {
+                        tracing::warn!("Script error ({}): {}", execution_url, error);
+                    }
+                    let _ =
+                        js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
                 }
-                // Script bodies: only the HTTP Content-Type charset matters
-                // (no in-band meta-charset for JS).
-                let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                fetched.insert(idx, (url, code, resp));
+            }
+        } else if !script.inline.is_empty() {
+            if let Some(js) = &mut self.js {
+                let _ = js.execute_script(
+                    "<current-script>",
+                    &format!("globalThis.__currentScriptNid={};", script.nid),
+                );
+                if let Err(error) = js.execute_script_guarded(&script.base_url, &script.inline) {
+                    tracing::warn!("Inline script error: {}", error);
+                }
+                let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
             }
         }
+    }
+
+    /// readyState becomes complete before the load event. A script inserted by
+    /// an onload handler is therefore post-load work and remains pending until
+    /// an explicit caller settle/wait.
+    fn dispatch_load_event(js: &mut ObscuraJsRuntime) {
+        js.record_navigation_timing("domComplete");
+        js.record_navigation_timing("loadEventStart");
+        let completed = js.execute_script(
+            "<load-event>",
+            "globalThis.__documentReadyState__ = 'complete';\n\
+             try {\n\
+               const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
+               try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
+             } catch(e) {}",
+        );
+        if completed.is_ok() {
+            js.record_navigation_timing("loadEventEnd");
+        }
+    }
+
+    /// Whether a load phase is still running after navigation returned at
+    /// DOMContentLoaded.
+    pub fn load_pending(&self) -> bool {
+        self.pending_load.is_some()
+    }
+
+    /// True once after a deferred load phase has fired `load`, so the CDP
+    /// layer can emit the load lifecycle events it held back.
+    pub fn take_deferred_load_fired(&mut self) -> bool {
+        std::mem::take(&mut self.deferred_load_fired)
+    }
+
+    /// Runs the late async scripts whose downloads have landed and fires
+    /// `load` once none are left and no load-delaying dynamic script is
+    /// pending, or the script deadline has passed. Never awaits, so a
+    /// cancelled wait can always resume from `pending_load`. Returns whether
+    /// the load phase is over.
+    fn step_pending_load(&mut self) -> bool {
+        let Some(mut load) = self.pending_load.take() else {
+            return true;
+        };
+        for done in std::mem::take(&mut load.joined) {
+            self.absorb_script_fetch(&mut load.prefetch, done);
+        }
+        while let Some(Ok(done)) = load.prefetch.fetches.try_join_next() {
+            self.absorb_script_fetch(&mut load.prefetch, done);
+        }
+        while let Some(position) =
+            load.late_async.iter().position(|index| load.prefetch.finished.contains(index))
+        {
+            let index = load.late_async.remove(position);
+            let fetched_script = load.prefetch.ready.remove(&index);
+            self.execute_parser_classic(&load.scripts[index], fetched_script);
+            load.js_idle = false;
+        }
+        let past_deadline = tokio::time::Instant::now() >= load.deadline;
+        let load_delaying = self
+            .js
+            .as_mut()
+            .is_some_and(|js| js.has_pending_load_delaying_scripts());
+        if !past_deadline && (!load.late_async.is_empty() || load_delaying) {
+            self.pending_load = Some(load);
+            return false;
+        }
+        if past_deadline {
+            tracing::warn!(
+                late_async = load.late_async.len(),
+                load_delaying,
+                "script deadline reached with load-phase work pending; firing load"
+            );
+        }
+        if let Some(js) = &mut self.js {
+            Self::dispatch_load_event(js);
+            if let Some(title) = js.evaluate("document.title").ok().and_then(|value| {
+                value.as_str().map(str::to_string)
+            }) {
+                self.title = title;
+            }
+        }
+        self.lifecycle = LifecycleState::Loaded;
+        self.deferred_load_fired = true;
+        self.sync_js_network_events();
+        tracing::debug!(
+            phase = "script-execution-total",
+            elapsed_ms = load.started.elapsed().as_millis(),
+            "deferred load phase complete",
+        );
+        true
+    }
+
+    /// Waits until a late async download lands, the page's event loop makes
+    /// progress, the script deadline passes, or `until`. Cancel-safe: the only
+    /// state it touches is `pending_load`, which a dropped wait leaves intact.
+    async fn wait_pending_load(&mut self, until: tokio::time::Instant) {
+        enum Woke {
+            Fetched(Option<(usize, Option<(String, obscura_net::Response)>)>),
+            EventLoop(bool),
+            Timer,
+        }
+        let Page { js, pending_load, .. } = self;
+        let Some(load) = pending_load.as_mut() else {
+            return;
+        };
+        let wake_at = until.min(load.deadline);
+        let fetching = !load.late_async.is_empty() && !load.prefetch.fetches.is_empty();
+        let run_event_loop = !load.js_idle && js.is_some();
+        let woke = tokio::select! {
+            joined = load.prefetch.fetches.join_next(), if fetching => {
+                Woke::Fetched(joined.and_then(Result::ok))
+            }
+            turn = async {
+                match js.as_mut() {
+                    Some(js) => js.run_autonomous_event_loop_turn().await,
+                    None => Ok(true),
+                }
+            }, if run_event_loop => Woke::EventLoop(matches!(turn, Ok(true))),
+            _ = tokio::time::sleep_until(wake_at) => Woke::Timer,
+        };
+        match woke {
+            Woke::Fetched(Some(done)) => {
+                load.joined.push(done);
+                load.js_idle = false;
+            }
+            Woke::Fetched(None) | Woke::Timer => {}
+            Woke::EventLoop(idle) => load.js_idle = idle,
+        }
+    }
+
+    /// Drives a deferred load phase for at most `budget`, for callers that
+    /// own the page for a while (settle). Returns whether `load` has fired.
+    pub async fn advance_pending_load(&mut self, budget: std::time::Duration) -> bool {
+        let until = tokio::time::Instant::now() + budget;
+        loop {
+            if self.step_pending_load() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= until {
+                return false;
+            }
+            self.wait_pending_load(until).await;
+        }
+    }
+
+    /// Waits until the document's content has settled, for a crawler or a
+    /// capture that needs the page as a reader sees it rather than its load
+    /// event: no observable DOM mutation for the policy's quiet window, no
+    /// fetch()/XHR to the page's own site in flight, and no other request or
+    /// dynamic script in flight unless it has been pending for longer than
+    /// the grace period (a tracker or ad host that never answers is not
+    /// content). A load phase left by a DOMContentLoaded navigation keeps
+    /// advancing meanwhile (late async scripts run as they land), but `load`
+    /// itself is not awaited. Bounded by the policy's budget.
+    pub async fn settle_content(&mut self, policy: SettlePolicy) -> ContentSettle {
+        const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        let deadline = started + policy.budget;
+        let grace_until = started + policy.grace;
+        let mut generation = self.js.as_ref().map_or(0, |js| js.activity_generation());
+        let mut quiet_since = started;
+        let mut content = self.js.as_ref().map_or(0, |js| js.content_generation());
+        let mut content_quiet_since = started;
+        // A loaded document that ran no script and waits on no timer or
+        // request cannot change any more: the quiet period would be idle.
+        if self.pending_load.is_none() {
+            if let Some(js) = self.js.as_mut() {
+                if !js.has_started_scripts()
+                    && !js.has_pending_network_requests()
+                    && !js.has_pending_timers()
+                    && !js.has_pending_dynamic_scripts()
+                {
+                    return ContentSettle { settled: true, load_fired: true, elapsed: started.elapsed() };
+                }
+            }
+        }
+        loop {
+            if self.pending_load.is_some() {
+                self.step_pending_load();
+            }
+            let load_fired = self.pending_load.is_none();
+            let now = tokio::time::Instant::now();
+            let Some(js) = self.js.as_mut() else {
+                return ContentSettle { settled: true, load_fired: true, elapsed: started.elapsed() };
+            };
+            let current = js.activity_generation();
+            if current != generation {
+                generation = current;
+                quiet_since = now;
+            }
+            let current = js.content_generation();
+            if current != content {
+                content = current;
+                content_quiet_since = now;
+            }
+            // Once `load` has fired the page considers itself loaded, so only
+            // its own data requests and lazy code still hold the wait: a
+            // route's chunk still loading renders the content when it lands.
+            let network = js.has_pending_same_site_requests()
+                || js.has_pending_dynamic_imports()
+                || (!load_fired
+                    && now < grace_until
+                    && (js.has_pending_network_requests() || js.has_pending_dynamic_scripts()));
+            let quiet = if load_fired { policy.quiet_after_load } else { policy.quiet };
+            let content_still = policy
+                .content_quiet
+                .is_some_and(|still| now.duration_since(content_quiet_since) >= quiet.max(still));
+            if !network && (now.duration_since(quiet_since) >= quiet || content_still) {
+                return ContentSettle {
+                    settled: true,
+                    load_fired: self.pending_load.is_none(),
+                    elapsed: started.elapsed(),
+                };
+            }
+            if now >= deadline {
+                return ContentSettle {
+                    settled: false,
+                    load_fired: self.pending_load.is_none(),
+                    elapsed: started.elapsed(),
+                };
+            }
+            let slice_end = (now + SLICE).min(deadline);
+            if self.pending_load.is_some() {
+                self.wait_pending_load(slice_end).await;
+            } else if let Some(js) = self.js.as_mut() {
+                let _ = tokio::time::timeout_at(slice_end, js.run_autonomous_event_loop_turn()).await;
+                // A turn with nothing to do returns at once; do not spin.
+                tokio::time::sleep_until(slice_end).await;
+            }
+        }
+    }
+
+    /// `defer_load`: return once DOMContentLoaded has fired and leave the rest
+    /// of the load phase (late async scripts, load-delaying dynamic scripts,
+    /// the load event) in `pending_load`, if any of it is left.
+    async fn execute_scripts_with_module_budget(
+        &mut self,
+        module_budget_override: Option<u64>,
+        defer_load: bool,
+    ) {
+        let scripts_started = std::time::Instant::now();
+        tracing::info!(
+            "execute_scripts called, js runtime exists: {}",
+            self.js.is_some()
+        );
+        // Soft deadline on the entire script-execution phase. Heavy SPAs
+        // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
+        // fetch + execute loop can blow past a Puppeteer/Playwright goto
+        // timeout. The old 10s default was too tight: a heavy React/Vue/Angular
+        // SPA had its remaining scripts skipped before the app booted, so it
+        // never fired its XHR/fetch calls and page.on('response') saw nothing
+        // (issue #361). Only pages that actually run past the deadline are
+        // affected; fast pages finish and return well before it, so a larger
+        // budget costs them nothing. 30s gives an app room to initialize while
+        // the per-phase watchdog (armed at this + 1s) still bounds a real
+        // synchronous hang. Raise it further with OBSCURA_SCRIPT_DEADLINE_MS=<ms>
+        // for very heavy SPAs on slow networks (pair it with a matching client
+        // navigation timeout).
+        let script_deadline_ms: u64 = script_deadline_override().unwrap_or_else(|| {
+            std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000)
+        });
+        let script_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
+
+        // Hard backstop over the WHOLE script-execution phase. Inline scripts
+        // run back-to-back with no await between them, so neither the soft
+        // deadline above (only checked between scripts) nor the per-script guard
+        // can interrupt a page that burns the budget across many synchronous
+        // scripts (the real-world SPA / anti-bot busy-loop hang). This watchdog
+        // terminates the isolate if cumulative synchronous script work overruns.
+        let exec_wd = self
+            .js
+            .as_mut()
+            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(script_deadline_ms + 1000)));
+
+
+        let prefetch = match self.script_prefetch.take() {
+            Some(prefetch) => Some(prefetch),
+            None => self.start_script_fetches(),
+        };
+        let Some(mut pending) = prefetch else {
+            return;
+        };
+        let all_scripts = std::mem::take(&mut pending.scripts);
+
+        // HTML scripts have an "already started" flag. Mark every
+        // parser-discovered script before running page code so React/Next
+        // hydration can move or hoist those nodes without appendChild
+        // executing them a second time.
+        if let Some(js) = &mut self.js {
+            let ids = all_scripts
+                .iter()
+                .map(|script| script.nid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = js.execute_script(
+                "<parser-scripts>",
+                &format!("globalThis.__markParserScripts([{}]);", ids),
+            );
+        }
+
 
         // Spec: readyState is "loading" while parser-discovered scripts execute.
         // Scripts that check readyState === 'loading' will register DOMContentLoaded
@@ -2654,51 +3121,20 @@ impl Page {
             |page: &mut Self,
              script: &ScriptInfo,
              fetched_script: Option<(String, String, obscura_net::Response)>| {
-                if script.src.is_some() {
-                    if let Some((url, code, resp)) = fetched_script {
-                        tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                        let execution_url = resp.url.to_string();
-                        page.record_network_event_with_body(
-                            &url,
-                            "GET",
-                            "Script",
-                            resp.status,
-                            &resp.headers,
-                            &resp.body,
-                            false,
-                        );
-                        if let Some(js) = &mut page.js {
-                            let _ = js.execute_script(
-                                "<current-script>",
-                                &format!("globalThis.__currentScriptNid={};", script.nid),
-                            );
-                            if let Err(error) = js.execute_script_guarded(&execution_url, &code) {
-                                tracing::warn!("Script error ({}): {}", execution_url, error);
-                            }
-                            let _ = js.execute_script(
-                                "<current-script>",
-                                "globalThis.__currentScriptNid=0;",
-                            );
-                        }
-                    }
-                } else if !script.inline.is_empty() {
-                    if let Some(js) = &mut page.js {
-                        let _ = js.execute_script(
-                            "<current-script>",
-                            &format!("globalThis.__currentScriptNid={};", script.nid),
-                        );
-                        if let Err(error) =
-                            js.execute_script_guarded(&script.base_url, &script.inline)
-                        {
-                            tracing::warn!("Inline script error: {}", error);
-                        }
-                        let _ = js
-                            .execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
-                    }
-                }
+                page.execute_parser_classic(script, fetched_script)
             };
 
         let mut post_parse = Vec::new();
+        let mut late_async = Vec::new();
+        let pending_script_arrived = |page: &mut Self, pending: &mut ScriptPrefetch, index: usize| {
+            if !pending.planned.contains(&index) {
+                return true;
+            }
+            while let Some(Ok(done)) = pending.fetches.try_join_next() {
+                page.absorb_script_fetch(pending, done);
+            }
+            pending.finished.contains(&index)
+        };
 
         // Process parser-discovered scripts in encounter order. Import maps
         // register at their exact position; module graphs start there too, but
@@ -2727,8 +3163,15 @@ impl Page {
                 ScriptKind::Classic => {
                     if script.is_defer && !script.is_async && script.src.is_some() {
                         post_parse.push(ScheduledScript::Classic(index));
+                    } else if script.is_async && !pending_script_arrived(self, &mut pending, index) {
+                        // An async script runs when its download finishes, not
+                        // in document order, so a slow one must not hold up the
+                        // parser-blocking scripts behind it.
+                        late_async.push(index);
                     } else {
-                        let fetched_script = fetched.remove(&index);
+                        // Parser-blocking: the parser (and so the event loop
+                        // that would see later markup) waits.
+                        let fetched_script = self.script_body(&mut pending, index, script_deadline, false).await;
                         execute_classic(self, script, fetched_script);
                         if let Some(js) = &mut self.js {
                             if js.take_document_write_inserted_script()
@@ -2902,7 +3345,7 @@ impl Page {
             match scheduled {
                 ScheduledScript::Classic(index) => {
                     let script = &all_scripts[index];
-                    let fetched_script = fetched.remove(&index);
+                    let fetched_script = self.script_body(&mut pending, index, script_deadline, true).await;
                     execute_classic(self, script, fetched_script);
                     if let Some(js) = &mut self.js {
                         if js.take_document_write_inserted_script()
@@ -2974,7 +3417,75 @@ impl Page {
             if completed.is_ok() {
                 js.record_navigation_timing("domContentLoadedEventEnd");
             }
+        }
 
+        // A caller that only waits for DOMContentLoaded gets the page now, as
+        // a browser would hand it over: the late async scripts and the
+        // load-delaying dynamic ones finish in the background and fire `load`
+        // later (`advance_pending_load`, the autonomous event-loop turn).
+        let load_work_left = !late_async.is_empty()
+            || self
+                .js
+                .as_mut()
+                .is_some_and(|js| js.has_pending_load_delaying_scripts());
+        if defer_load && load_work_left {
+            if let Some(token) = exec_wd {
+                if let Some(js) = self.js.as_mut() {
+                    js.disarm_watchdog(token);
+                }
+            }
+            tracing::debug!(
+                phase = "script-execution-dcl",
+                elapsed_ms = scripts_started.elapsed().as_millis(),
+                late_async = late_async.len(),
+                "returning at DOMContentLoaded; the load phase continues",
+            );
+            self.pending_load = Some(PendingLoad {
+                scripts: all_scripts,
+                prefetch: pending,
+                late_async,
+                joined: Vec::new(),
+                deadline: script_deadline,
+                started: scripts_started,
+                js_idle: false,
+            });
+            self.sync_js_network_events();
+            return;
+        }
+
+        // Async scripts that had not arrived when the parser reached them run
+        // as their downloads finish, in arrival order. Like dynamic scripts
+        // they delay the load event but not DOMContentLoaded, so a stalled
+        // third-party script (an ad host that drops packets, analytics that
+        // never answers) no longer holds back the defer and module scripts or
+        // the DOMContentLoaded listeners.
+        while !late_async.is_empty() {
+            while let Some(Ok(done)) = pending.fetches.try_join_next() {
+                self.absorb_script_fetch(&mut pending, done);
+            }
+            if let Some(position) =
+                late_async.iter().position(|index| pending.finished.contains(index))
+            {
+                let index = late_async.remove(position);
+                let fetched_script = pending.ready.remove(&index);
+                execute_classic(self, &all_scripts[index], fetched_script);
+                continue;
+            }
+            match tokio::time::timeout_at(script_deadline, pending.fetches.join_next()).await {
+                Ok(Some(Ok(done))) => self.absorb_script_fetch(&mut pending, done),
+                Ok(Some(Err(_))) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        "execute_scripts: deadline reached with {} async scripts still loading",
+                        late_async.len()
+                    );
+                    break;
+                }
+            }
+        }
+
+        if let Some(js) = &mut self.js {
             let load_blockers_finished =
                 Self::drive_load_delaying_scripts(js, script_deadline).await;
             if !load_blockers_finished {
@@ -2982,23 +3493,7 @@ impl Page {
                     "script deadline reached with load-delaying dynamic scripts still pending"
                 );
             }
-
-            // readyState becomes complete before the load event. A script
-            // inserted by an onload handler is therefore post-load work and
-            // remains pending until an explicit caller settle/wait.
-            js.record_navigation_timing("domComplete");
-            js.record_navigation_timing("loadEventStart");
-            let completed = js.execute_script(
-                "<load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
-                 try {\n\
-                   const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
-                   try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
-                 } catch(e) {}",
-            );
-            if completed.is_ok() {
-                js.record_navigation_timing("loadEventEnd");
-            }
+            Self::dispatch_load_event(js);
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
@@ -3088,6 +3583,13 @@ impl Page {
             if remaining == 0 {
                 break;
             }
+            if self.pending_load.is_some() {
+                // Finish a load phase left by a DOMContentLoaded navigation
+                // within this settle's budget before judging quiescence.
+                self.advance_pending_load(std::time::Duration::from_millis(remaining))
+                    .await;
+                continue;
+            }
             if let Some(js) = &mut self.js {
                 if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
                     Self::settle_runtime_for_duration(js, remaining).await;
@@ -3138,6 +3640,12 @@ impl Page {
         if duration_ms == 0 {
             return;
         }
+        let started = std::time::Instant::now();
+        if self.pending_load.is_some() {
+            self.advance_pending_load(std::time::Duration::from_millis(duration_ms))
+                .await;
+        }
+        let duration_ms = duration_ms.saturating_sub(started.elapsed().as_millis() as u64);
         if let Some(js) = &mut self.js {
             Self::settle_runtime_for_duration(js, duration_ms).await;
         }
@@ -3154,6 +3662,18 @@ impl Page {
     /// higher-priority automation commands.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
+        if self.pending_load.is_some() {
+            // A navigation returned at DOMContentLoaded: finish its load phase
+            // first. The wait runs the page's own event loop too, so timers
+            // and fetches keep going while late async scripts download.
+            if !self.step_pending_load() {
+                self.wait_pending_load(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                )
+                .await;
+            }
+            return Ok(false);
+        }
         #[cfg(feature = "render")]
         {
             self.queue_pending_render_resources();
@@ -3407,8 +3927,12 @@ impl Page {
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
         self.navigation_timing = NavigationTiming::default();
+        let nav_started = std::time::Instant::now();
 
         // The previous document's background loads end with the document.
+        self.script_prefetch = None;
+        self.pending_load = None;
+        self.deferred_load_fired = false;
         self.retire_render_resources();
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
@@ -3501,6 +4025,7 @@ impl Page {
         })?;
         self.navigation_timing.record("responseEnd");
 
+        tracing::debug!(phase = "nav-document-fetched", elapsed_ms = nav_started.elapsed().as_millis());
         // Store binary main resources (images, PDFs, octet-stream) base64 so
         // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
         // corrupts them (issue #340). Text-like types stay as text.
@@ -3548,7 +4073,11 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
+        tracing::debug!(phase = "nav-js-init", elapsed_ms = nav_started.elapsed().as_millis());
+        // Start the script downloads now so they overlap the stylesheet wave.
+        self.script_prefetch = self.start_script_fetches();
         let author_stylesheets = self.fetch_stylesheets().await;
+        tracing::debug!(phase = "nav-stylesheets", elapsed_ms = nav_started.elapsed().as_millis());
 
         // Install fetched CSS in native DOM state. Cross-origin bytes must not
         // become observable through a synthetic style element or page global.
@@ -3625,8 +4154,15 @@ impl Page {
         // every inline <script> in the page was silently dropped: form
         // listeners never registered, frameworks never bootstrapped,
         // page.click() handlers were no-ops. Now scripts run regardless
-        // of waitUntil and DCL means "DOM parsed AND scripts executed".
-        self.execute_scripts().await;
+        // of waitUntil and DCL means "DOM parsed AND scripts executed". With
+        // waitUntil=domcontentloaded the load phase (late async scripts,
+        // load-delaying dynamic scripts, the load event) is left running.
+        self.execute_scripts_with_module_budget(
+            None,
+            wait_until == crate::lifecycle::WaitUntil::DomContentLoaded,
+        )
+        .await;
+        tracing::debug!(phase = "nav-scripts", elapsed_ms = nav_started.elapsed().as_millis());
         // The document's own scripts are the common source of storage writes,
         // so the profile is flushed once they have run, not before.
         self.context.save_local_storage();
@@ -3646,6 +4182,7 @@ impl Page {
             let _ = self.prepare_screenshot_resources(warmup_ms).await;
         }
 
+        tracing::debug!(phase = "nav-dcl", elapsed_ms = nav_started.elapsed().as_millis());
         self.lifecycle = LifecycleState::DomContentLoaded;
 
         // Before any `wait_until` can return, because the frames belong to the
@@ -7957,6 +8494,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn timers_run_while_a_deferred_script_downloads() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let body = "globalThis.__seenAtDeferred = document.body.dataset.timer || 'missing';";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut page = import_map_test_page(
+            "deferred-drives-event-loop",
+            &base,
+            r#"<html><head>
+                <script>setTimeout(() => { document.body.dataset.timer = "fired"; }, 50);</script>
+                <script defer src="./slow.js"></script>
+            </head><body></body></html>"#,
+        );
+        page.execute_scripts().await;
+
+        // A browser keeps running tasks while a deferred script downloads.
+        let seen = page.js.as_mut().unwrap().evaluate("globalThis.__seenAtDeferred").unwrap();
+        assert_eq!(seen, serde_json::json!("fired"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn module_graph_and_evaluation_share_one_active_budget() {
         use std::io::{Read as _, Write as _};
 
@@ -7999,7 +8571,7 @@ mod tests {
                 globalThis.__shared_deadline_completed = true;
             </script></head><body></body></html>"#,
         );
-        page.execute_scripts_with_module_budget(Some(350)).await;
+        page.execute_scripts_with_module_budget(Some(350), false).await;
 
         assert_eq!(
             request_rx
@@ -8065,7 +8637,7 @@ mod tests {
                 </script>
             </head><body></body></html>"#,
         );
-        page.execute_scripts_with_module_budget(Some(300)).await;
+        page.execute_scripts_with_module_budget(Some(300), false).await;
 
         assert_eq!(
             page.js
@@ -8192,6 +8764,11 @@ mod tests {
             <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
         </head><body></body></html>"#,
         );
+        // An async script runs in place only if its download has finished when
+        // the parser reaches it; give the download the head start navigation
+        // gives it while stylesheets load.
+        page.script_prefetch = page.start_script_fetches();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         page.execute_scripts().await;
         page.settle_for_duration(500).await;
         assert_eq!(
@@ -8376,7 +8953,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn navigation_timing_terminated_handlers_do_not_record_completion() {
-        std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "250");
+        // A thread-local deadline: setting OBSCURA_SCRIPT_DEADLINE_MS here
+        // shortened it for every test running alongside, and failed those
+        // with slower deferred scripts.
+        super::SCRIPT_DEADLINE_FOR_TEST.with(|deadline| deadline.set(Some(250)));
         let mut page = import_map_test_page(
             "terminated-navigation-timing", "http://127.0.0.1:9", "<html><body></body></html>",
         );
@@ -8928,6 +9508,108 @@ mod tests {
                 .unwrap(),
             serde_json::json!("lazy-ready"),
             "an explicit caller settle must drive the lazy module graph",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_settle_of_a_scriptless_page_is_immediate() {
+        let mut page = import_map_test_page(
+            "scriptless-settle", "http://127.0.0.1:9", "<html><body><p>static</p></body></html>",
+        );
+        page.execute_scripts().await;
+        let started = std::time::Instant::now();
+        let settle = page.settle_content(super::SettlePolicy::default()).await;
+        assert!(settle.settled);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100), "{:?}", started.elapsed());
+
+        let mut page = import_map_test_page(
+            "timer-settle",
+            "http://127.0.0.1:9",
+            "<html><body><p>first</p><script>setTimeout(() => { document.querySelector('p').textContent = 'later'; }, 100);</script></body></html>",
+        );
+        page.execute_scripts().await;
+        let settle = page.settle_content(super::SettlePolicy::default()).await;
+        assert!(settle.settled);
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("document.querySelector('p').textContent").unwrap(),
+            serde_json::json!("later"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_settle_ends_once_only_animation_frames_keep_writing() {
+        let html = r#"<html><body><main>first</main><div id=spinner></div><script>
+            setTimeout(() => { document.querySelector('main').textContent = 'loaded'; }, 300);
+            let turn = 0;
+            setInterval(() => {
+                const spinner = document.getElementById('spinner');
+                spinner.style.transform = `rotate(${++turn}deg)`;
+                spinner.className = turn % 2 ? 'odd' : 'even';
+                spinner.setAttribute('data-turn', String(turn));
+            }, 30);
+        </script></body></html>"#;
+        let budget = std::time::Duration::from_secs(3);
+        let mut page = import_map_test_page("animation-settle", "http://127.0.0.1:9", html);
+        page.execute_scripts().await;
+        let started = std::time::Instant::now();
+        let settle = page
+            .settle_content(super::SettlePolicy {
+                budget,
+                content_quiet: Some(std::time::Duration::from_millis(500)),
+                ..super::SettlePolicy::default()
+            })
+            .await;
+        assert!(settle.settled, "the spinner held the wait for the whole budget");
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_500), "{:?}", started.elapsed());
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("document.querySelector('main').textContent").unwrap(),
+            serde_json::json!("loaded"),
+        );
+
+        let mut page = import_map_test_page("animation-no-content-quiet", "http://127.0.0.1:9", html);
+        page.execute_scripts().await;
+        let settle = page.settle_content(super::SettlePolicy { budget, ..super::SettlePolicy::default() }).await;
+        assert!(!settle.settled, "without content_quiet any activity holds the wait");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_settle_waits_for_a_route_chunk_after_load() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            // Longer than the quiet that settles a loaded page.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let body = "export const members = 'team';";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut page = import_map_test_page(
+            "route-chunk-settle",
+            &base,
+            r#"<html><body><main></main><script>
+                import("./team.js").then(module => {
+                    document.querySelector("main").textContent = module.members;
+                });
+            </script></body></html>"#,
+        );
+        page.execute_scripts().await;
+        let settle = page.settle_content(super::SettlePolicy::default()).await;
+
+        assert!(settle.settled);
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("document.querySelector('main').textContent").unwrap(),
+            serde_json::json!("team"),
+            "the snapshot was taken before the route's chunk rendered",
         );
     }
 

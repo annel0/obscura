@@ -1058,39 +1058,41 @@ pub fn emit_navigation_events(
             tracing::warn!("could not produce navigation screencast frame: {error}");
         }
     }
-    let mut phase3 = if ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed) {
-        Vec::new()
-    } else { vec![
-        CdpEvent {
+    let failed = ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed);
+    // A navigation that returned at DOMContentLoaded while its page keeps
+    // loading reports DOMContentLoaded now and `load` once the page fires it
+    // (emit_deferred_load_events), the way Chrome streams the two.
+    let load_deferred = !failed && ctx.get_page(page_id).is_some_and(|page| page.load_pending());
+    ctx.deferred_loads.remove(page_id);
+    let mut phase3 = Vec::new();
+    if !failed {
+        phase3.push(CdpEvent {
             method: "Page.lifecycleEvent".into(),
             params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
             session_id: es.clone(),
-        },
-        CdpEvent {
+        });
+        phase3.push(CdpEvent {
             method: "Page.domContentEventFired".into(),
             params: json!({"timestamp": ts}),
             session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.loadEventFired".into(),
-            params: json!({"timestamp": ts}),
-            session_id: es.clone(),
-        },
-    ] };
-    if !phase3.is_empty() && (reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded)) {
-        let idle_ts = timestamp();
-        phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
+        });
     }
-    phase3.push(CdpEvent {
-        method: "Page.frameStoppedLoading".into(),
-        params: json!({"frameId": frame_id}),
-        session_id: es,
-    });
+    if load_deferred {
+        ctx.deferred_loads.insert(
+            page_id.to_string(),
+            (es.clone(), frame_id.to_string(), loader_id.to_string()),
+        );
+    } else if failed {
+        phase3.push(CdpEvent {
+            method: "Page.frameStoppedLoading".into(),
+            params: json!({"frameId": frame_id}),
+            session_id: es,
+        });
+    } else {
+        let network_idle = reached_network_idle
+            || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded);
+        phase3.extend(load_lifecycle_events(&es, frame_id, loader_id, ts, network_idle));
+    }
     ctx.pending_events.extend(phase3);
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
@@ -1295,6 +1297,67 @@ pub(crate) fn emit_aborted_navigation(
         params: json!({"frameId": frame_id}),
     });
     fan_out_network_events(ctx, page_id, session_id, start);
+}
+
+/// The lifecycle events from `load` on: `load`, `Page.loadEventFired`,
+/// optionally `networkIdle`, then `Page.frameStoppedLoading`.
+fn load_lifecycle_events(
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    ts: f64,
+    network_idle: bool,
+) -> Vec<CdpEvent> {
+    let mut events = vec![
+        CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
+            session_id: session_id.clone(),
+        },
+        CdpEvent {
+            method: "Page.loadEventFired".into(),
+            params: json!({"timestamp": ts}),
+            session_id: session_id.clone(),
+        },
+    ];
+    if network_idle {
+        events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": timestamp()}),
+            session_id: session_id.clone(),
+        });
+    }
+    events.push(CdpEvent {
+        method: "Page.frameStoppedLoading".into(),
+        params: json!({"frameId": frame_id}),
+        session_id: session_id.clone(),
+    });
+    events
+}
+
+/// Emits the load lifecycle events a navigation held back when it returned at
+/// DOMContentLoaded, once its page has fired `load`. Runs after every command
+/// and every autonomous event-loop turn.
+pub fn emit_deferred_load_events(ctx: &mut CdpContext) {
+    if ctx.deferred_loads.is_empty() {
+        return;
+    }
+    let fired: Vec<String> = ctx
+        .pages
+        .iter_mut()
+        .filter_map(|page| page.take_deferred_load_fired().then(|| page.id.clone()))
+        .collect();
+    for page_id in fired {
+        let Some((session_id, frame_id, loader_id)) = ctx.deferred_loads.remove(&page_id) else {
+            continue;
+        };
+        // A newer navigation replaced the document whose load this was.
+        if ctx.current_loader_ids.get(&page_id) != Some(&loader_id) {
+            continue;
+        }
+        let events = load_lifecycle_events(&session_id, &frame_id, &loader_id, timestamp(), true);
+        ctx.pending_events.extend(events);
+    }
 }
 
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on

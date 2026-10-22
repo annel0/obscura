@@ -130,7 +130,9 @@ Object.defineProperty(globalThis, "__obscura_binding_called", {
 globalThis.__obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
-globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.preventDefault(); };
+// No default onunhandledrejection: it used to cancel every rejection, which hid
+// them from CDP clients and left `window.onunhandledrejection` a function where
+// browsers have null (the GlobalEventHandlers loop below sets it).
 
 globalThis.onerror = function(msg, src, line, col, error) {
   globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
@@ -2434,6 +2436,15 @@ function _isDomNode(value) {
       && (typeof value._nid === "number" || value._documentShim === true));
 }
 
+// A token list's [PutForwards=value] setter: the attribute when the element
+// has the list, an ordinary own property when it does not.
+function _putForwardTokens(element, property, attribute, value) {
+  if (element[property] !== undefined) {
+    element.setAttribute(attribute, String(value));
+  } else {
+    Object.defineProperty(element, property, { value, writable: true, configurable: true, enumerable: true });
+  }
+}
 function _requireNodeArgument(value, method, position, iface = "Node") {
   if (!_isDomNode(value)) {
     throw new TypeError(
@@ -3077,6 +3088,11 @@ class Node {
   }
 }
 class CharacterData extends Node {
+  // NonDocumentTypeChildNode: text and comments have element siblings too.
+  // Lit's hydration finds an element from its <!--lit-node--> marker this
+  // way, and threw on every MDN page without them.
+  get nextElementSibling() { let s = this.nextSibling; while (s && s.nodeType !== 1) s = s.nextSibling; return s; }
+  get previousElementSibling() { let s = this.previousSibling; while (s && s.nodeType !== 1) s = s.previousSibling; return s; }
   get data() {
     return _domParse("text_content", this._nid) ?? "";
   }
@@ -4077,7 +4093,7 @@ class Element extends Node {
     // SVG elements reflect class as an SVGAnimatedString (.baseVal/.animVal),
     // not a plain string. Anti-fraud sensors read el.className.animVal.
     if (this.namespaceURI === "http://www.w3.org/2000/svg") {
-      if (!this._svgClassName) this._svgClassName = new SVGAnimatedString(this, "class");
+      if (!this._svgClassName) this._svgClassName = new SVGAnimatedString(_svgAnimatedStringKey, this, "class");
       return this._svgClassName;
     }
     return this.getAttribute("class") || "";
@@ -4196,6 +4212,11 @@ class Element extends Node {
     if (!this._classList) this._classList = new DOMTokenList(this, "class");
     return this._classList;
   }
+  // The token lists are [PutForwards=value]: a string assigned to one sets
+  // the attribute. Getter-only, they threw in strict code (MDN assigns
+  // iframe.sandbox). Where an element has no such list, the assignment
+  // makes an ordinary own property, as it would in a browser.
+  set classList(value) { this.setAttribute("class", String(value)); }
   get relList() {
     const ns = this.namespaceURI, ln = this.localName;
     const ok = (ns === "http://www.w3.org/2000/svg" && ln === "a") ||
@@ -4208,16 +4229,19 @@ class Element extends Node {
     if (!this._relList) this._relList = new DOMTokenList(this, "rel", ["alternate","dns-prefetch","icon","manifest","modulepreload","next","pingback","preconnect","prefetch","preload","prev","search","stylesheet"]);
     return this._relList;
   }
+  set relList(value) { _putForwardTokens(this, "relList", "rel", value); }
   get sandbox() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "iframe") return undefined;
     if (!this._sandboxList) this._sandboxList = new DOMTokenList(this, "sandbox", ["allow-downloads","allow-forms","allow-modals","allow-orientation-lock","allow-pointer-lock","allow-popups","allow-popups-to-escape-sandbox","allow-presentation","allow-same-origin","allow-scripts","allow-top-navigation","allow-top-navigation-by-user-activation","allow-top-navigation-to-custom-protocols"]);
     return this._sandboxList;
   }
+  set sandbox(value) { _putForwardTokens(this, "sandbox", "sandbox", value); }
   get sizes() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "link") return undefined;
     if (!this._sizesList) this._sizesList = new DOMTokenList(this, "sizes");
     return this._sizesList;
   }
+  set sizes(value) { _putForwardTokens(this, "sizes", "sizes", value); }
   get htmlFor() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
     const ln = this.localName;
@@ -4844,6 +4868,25 @@ class Element extends Node {
       this.textContent = value;
     }
   }
+  // defaultValue is the markup's value: the value attribute of an <input>,
+  // the text of a <textarea>. Vue's v-model reads it on every text field.
+  get defaultValue() {
+    const tag = this.localName;
+    if (tag === 'input') return this.getAttribute('value') ?? '';
+    if (tag === 'textarea') return this.textContent;
+    return undefined;
+  }
+  set defaultValue(v) {
+    const tag = this.localName;
+    if (tag === 'input') this.setAttribute('value', String(v));
+    else if (tag === 'textarea') this.textContent = String(v);
+  }
+  get defaultChecked() {
+    return this.localName === 'input' ? this.hasAttribute('checked') : undefined;
+  }
+  set defaultChecked(v) {
+    if (this.localName === 'input') this.toggleAttribute('checked', !!v);
+  }
   get min() { return this.getAttribute('min') || ''; }
   set min(v) { this.setAttribute('min', v); }
   get max() { return this.getAttribute('max') || ''; }
@@ -5004,10 +5047,11 @@ class Element extends Node {
   set placeholder(v) { this.setAttribute("placeholder", v); }
   get accept() { return this.getAttribute("accept") || ""; }
   set accept(v) { this.setAttribute("accept", v); }
-  // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
-  // and what scrapers want). It uses op_url_resolve, which returns just the
-  // resolved string, rather than the full-component op the decomposition
-  // members use. Other elements reflect the raw attribute.
+  // For <a>/<area>/<link>, href returns the resolved absolute URL (the spec
+  // behavior, and what scrapers want: `link[rel=canonical].href` and hreflang
+  // alternates used to come back relative). It uses op_url_resolve, which
+  // returns just the resolved string, rather than the full-component op the
+  // decomposition members use. Other elements reflect the raw attribute.
   get href() {
     const ln = this.localName;
     // SVG href-bearing elements reflect href as an SVGAnimatedString (with the
@@ -5017,10 +5061,10 @@ class Element extends Node {
         (ln === 'a' || ln === 'image' || ln === 'use' || ln === 'script' ||
          ln === 'pattern' || ln === 'filter' || ln === 'textPath' || ln === 'mpath' ||
          ln === 'linearGradient' || ln === 'radialGradient' || ln === 'feImage' || ln === 'tref')) {
-      if (!this._svgHref) this._svgHref = new SVGAnimatedString(this, "href", "xlink:href");
+      if (!this._svgHref) this._svgHref = new SVGAnimatedString(_svgAnimatedStringKey, this, "href", "xlink:href");
       return this._svgHref;
     }
-    if (ln === 'a' || ln === 'area') {
+    if (ln === 'a' || ln === 'area' || ln === 'link') {
       const raw = this.getAttribute('href');
       if (raw === null) return '';
       // Legacy-charset document: href must reflect the encoding-override query.
@@ -6224,6 +6268,68 @@ function _throwDocumentDomainSecurityError() {
 }
 
 const _documentInstances = new WeakSet();
+// document.implementation. A global interface with its methods on the
+// prototype, as consent managers (Transcend airgap on webflow.com) patch
+// DOMImplementation.prototype and threw on a missing interface.
+const _documentImplementations = new WeakMap();
+const _implementationOwners = new WeakMap();
+globalThis.DOMImplementation = class DOMImplementation {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  // Spec: createHTMLDocument returns a NEW detached Document. jQuery
+  // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
+  // the result: when we returned `globalThis.document`, the real
+  // `<body>` was wiped, taking every page on the open web that ships
+  // jQuery 3.x with it. Reuse the DOMParser path to build a detached
+  // document, then optionally set the title.
+  createHTMLDocument(title) {
+    const doc = _createDetachedDocument("text/html", false);
+    doc.appendChild(doc.implementation.createDocumentType("html", "", ""));
+    const html = doc.createElement("html");
+    doc.appendChild(html);
+    const head = doc.createElement("head");
+    html.appendChild(head);
+    if (title !== undefined) {
+      const titleEl = doc.createElement("title");
+      titleEl.appendChild(doc.createTextNode(String(title)));
+      head.appendChild(titleEl);
+    }
+    html.appendChild(doc.createElement("body"));
+    return doc;
+  }
+  createDocument(namespace, qualifiedName, doctype) {
+    const ns = namespace == null ? null : String(namespace);
+    const contentType = ns === "http://www.w3.org/1999/xhtml"
+      ? "application/xhtml+xml"
+      : (ns === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
+    const doc = _createDetachedDocument(contentType, true);
+    const name = qualifiedName == null ? "" : String(qualifiedName);
+    const element = name === "" ? null : doc.createElementNS(ns, name);
+    if (doctype != null) doc.appendChild(doctype);
+    if (element) doc.appendChild(element);
+    return doc;
+  }
+  // createDocumentType(qualifiedName, publicId, systemId): build a detached
+  // DocumentType node. Browsers validate leniently here (only a name with
+  // ASCII whitespace or ">" is rejected, matching the WPT cases); the node's
+  // owner document is the document whose implementation was used.
+  createDocumentType(qualifiedName, publicId, systemId) {
+    const name = String(qualifiedName);
+    if (name === "" || /[\t\n\f\r >]/.test(name)) {
+      throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
+    }
+    const dt = new DocumentType(
+      +_dom("create_doctype", name, publicId === undefined ? "" : String(publicId)),
+      name,
+      publicId === undefined ? "" : String(publicId),
+      systemId === undefined ? "" : String(systemId)
+    );
+    _seedDetachedTreeState(dt);
+    _cache.set(dt._nid, dt);
+    return _stampNodeDocument(dt, _implementationOwners.get(this));
+  }
+  hasFeature() { return true; }
+};
+
 class Document extends Node {
   constructor(nid) {
     super(nid);
@@ -6781,63 +6887,15 @@ class Document extends Node {
   // (issue #468). Standards mode, so documentElement; quirks mode would be
   // body, but we never parse in quirks mode.
   get scrollingElement() { return this.documentElement; }
+  // One DOMImplementation per document, as in browsers.
   get implementation() {
-    const ownerDoc = this;
-    return {
-      // Spec: createHTMLDocument returns a NEW detached Document. jQuery
-      // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
-      // the result: when we returned `globalThis.document`, the real
-      // `<body>` was wiped, taking every page on the open web that ships
-      // jQuery 3.x with it. Reuse the DOMParser path to build a detached
-      // document, then optionally set the title.
-      createHTMLDocument(title) {
-        const doc = _createDetachedDocument("text/html", false);
-        doc.appendChild(doc.implementation.createDocumentType("html", "", ""));
-        const html = doc.createElement("html");
-        doc.appendChild(html);
-        const head = doc.createElement("head");
-        html.appendChild(head);
-        if (title !== undefined) {
-          const titleEl = doc.createElement("title");
-          titleEl.appendChild(doc.createTextNode(String(title)));
-          head.appendChild(titleEl);
-        }
-        html.appendChild(doc.createElement("body"));
-        return doc;
-      },
-      createDocument(namespace, qualifiedName, doctype) {
-        const ns = namespace == null ? null : String(namespace);
-        const contentType = ns === "http://www.w3.org/1999/xhtml"
-          ? "application/xhtml+xml"
-          : (ns === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
-        const doc = _createDetachedDocument(contentType, true);
-        const name = qualifiedName == null ? "" : String(qualifiedName);
-        const element = name === "" ? null : doc.createElementNS(ns, name);
-        if (doctype != null) doc.appendChild(doctype);
-        if (element) doc.appendChild(element);
-        return doc;
-      },
-      // createDocumentType(qualifiedName, publicId, systemId): build a detached
-      // DocumentType node. Browsers validate leniently here (only a name with
-      // ASCII whitespace or ">" is rejected, matching the WPT cases); the node's
-      // owner document is the document whose implementation was used.
-      createDocumentType(qualifiedName, publicId, systemId) {
-        const name = String(qualifiedName);
-        if (name === "" || /[\t\n\f\r >]/.test(name)) {
-          throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
-        }
-        const dt = new DocumentType(
-          +_dom("create_doctype", name, publicId === undefined ? "" : String(publicId)),
-          name,
-          publicId === undefined ? "" : String(publicId),
-          systemId === undefined ? "" : String(systemId)
-        );
-        _seedDetachedTreeState(dt);
-        _cache.set(dt._nid, dt);
-        return _stampNodeDocument(dt, ownerDoc);
-      },
-      hasFeature() { return true; },
-    };
+    let implementation = _documentImplementations.get(this);
+    if (!implementation) {
+      implementation = Object.create(DOMImplementation.prototype);
+      _implementationOwners.set(implementation, this);
+      _documentImplementations.set(this, implementation);
+    }
+    return implementation;
   }
   get styleSheets() {
     if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
@@ -7631,6 +7689,14 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLIFrameElement;
   }
+  if (tag === "SCRIPT" && globalThis.HTMLScriptElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis.HTMLScriptElement;
+  }
+  if (typeof _valueElementClasses !== "undefined" && _valueElementClasses[tag]
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis[_valueElementClasses[tag]];
+  }
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -7657,6 +7723,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (localName === "li") return HTMLLIElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
+    if (tag === "SCRIPT" && globalThis.HTMLScriptElement) return globalThis.HTMLScriptElement;
+    if (typeof _valueElementClasses !== "undefined" && _valueElementClasses[tag]) return globalThis[_valueElementClasses[tag]];
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -7786,6 +7854,39 @@ globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
 
+// Window.name is a DOMString that starts as "" and stringifies assignments
+// (`var name = 5` leaves "5", as in browsers). It was missing, so `window.name`
+// read as undefined and string methods on it threw: Matomo's
+// `window.name.split("###")`, reached from `_paq.push(["trackPageView"])`, took
+// habr.com's whole Vue app down to its "internal error" screen. Configurable so
+// a page can still declare a top-level `let name`. Child frames start from ""
+// rather than the iframe's name attribute.
+(function () {
+  let windowName = "";
+  const get = _markNativeAs(function () { return windowName; }, "function get name() { [native code] }");
+  const set = _markNativeAs(function (value) { windowName = String(value); }, "function set name() { [native code] }");
+  Object.defineProperty(globalThis, "name", { get, set, configurable: true, enumerable: true });
+})();
+// A live browsing context is never closed.
+Object.defineProperty(globalThis, "closed", {
+  get: _markNativeAs(function () { return false; }, "function get closed() { [native code] }"),
+  configurable: true,
+  enumerable: true,
+});
+// Window.origin is [Replaceable]: it reads the document's origin until a page
+// assigns to it, and the assignment then shadows it with a plain value.
+Object.defineProperty(globalThis, "origin", {
+  get: _markNativeAs(function () { return globalThis.location.origin; }, "function get origin() { [native code] }"),
+  set: _markNativeAs(function (value) {
+    Object.defineProperty(globalThis, "origin", { value, writable: true, configurable: true, enumerable: true });
+  }, "function set origin() { [native code] }"),
+  configurable: true,
+  enumerable: true,
+});
+
+// on* handler values set on documents and elements, by object.
+const _eventHandlerValues = new WeakMap();
+
 // HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
 // mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
 // event path through these: jQuery checks `("on" + ev) in window`, and React
@@ -7813,7 +7914,23 @@ for (const _ev of [
   if (!(_on in globalThis)) globalThis[_on] = null;
   for (const _proto of [Document.prototype, Element.prototype]) {
     if (!(_on in _proto)) {
-      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
+      // Accessors, as in browsers: a page that freezes Element.prototype
+      // against tampering (sports.ru) made a data property read-only on every
+      // element, so `script.onerror = fn` threw and its ad loader died.
+      Object.defineProperty(_proto, _on, {
+        get() {
+          const handlers = _eventHandlerValues.get(this);
+          return handlers && handlers.has(_on) ? handlers.get(_on) : null;
+        },
+        set(value) {
+          let handlers = _eventHandlerValues.get(this);
+          if (!handlers) _eventHandlerValues.set(this, handlers = new Map());
+          // An EventHandler attribute keeps objects and drops anything else.
+          handlers.set(_on, typeof value === "function" || (typeof value === "object" && value !== null) ? value : null);
+        },
+        configurable: true,
+        enumerable: false,
+      });
     }
   }
 }
@@ -8077,7 +8194,7 @@ globalThis.navigator = {
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistration(){return Promise.resolve(undefined);}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
@@ -8096,9 +8213,9 @@ globalThis.navigator = {
     var n = params && params.name;
     // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
     // returning "granted" for camera/microphone is a bot tell.
-    if (n === 'notifications') return Promise.resolve({state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null});
-    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
-    return Promise.resolve({state: 'granted', onchange: null});
+    if (n === 'notifications') return Promise.resolve(_permissionStatus(n, (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt'));
+    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve(_permissionStatus(n, 'prompt'));
+    return Promise.resolve(_permissionStatus(n, 'granted'));
   } },
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
@@ -8139,6 +8256,24 @@ globalThis.navigator = {
     estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
     persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
+  },
+  // Chrome's prefixed quota API, still read by ad and anti-fraud scripts
+  // (sports.ru threw on it). Same quota as storage.estimate().
+  webkitTemporaryStorage: {
+    queryUsageAndQuota(success) {
+      if (typeof success === 'function') setTimeout(() => success(0, 5000000000), 0);
+    },
+    requestQuota(size, success) {
+      if (typeof success === 'function') setTimeout(() => success(Math.min(Number(size) || 0, 5000000000)), 0);
+    },
+  },
+  webkitPersistentStorage: {
+    queryUsageAndQuota(success) {
+      if (typeof success === 'function') setTimeout(() => success(0, 0), 0);
+    },
+    requestQuota(size, success) {
+      if (typeof success === 'function') setTimeout(() => success(0), 0);
+    },
   },
 };
 
@@ -9839,6 +9974,16 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   // width/height from the synthesized bounding rect makes those libraries
   // actually render content.
   const dimensionFor = (name) => {
+    // Only these read the box: any other property missing from the snapshot
+    // (transition timings, say) must not lay the document out to fall back.
+    switch (name) {
+      case 'width': case 'inline-size': case 'height': case 'block-size':
+      case 'left': case 'top': case 'right': case 'bottom':
+      case 'client-width': case 'offset-width': case 'client-height': case 'offset-height':
+        break;
+      default:
+        return null;
+    }
     try {
       const r = el.getBoundingClientRect && el.getBoundingClientRect();
       if (!r) return null;
@@ -11829,7 +11974,14 @@ __obscuraCore.setUnhandledPromiseRejectionHandler((promise, reason) => {
     reason,
     cancelable: true,
   });
-  globalThis.dispatchEvent(event);
+  // A rejection no handler cancels is reported the way Chrome reports it: as
+  // Runtime.exceptionThrown for CDP clients plus an "Uncaught (in promise)"
+  // console error. Before, it only reached page listeners, so crawlers never
+  // saw rejections that broke a page.
+  if (_eventTargetDispatch(globalThis, event)) {
+    __obscuraCore.ops.op_report_browser_exception(reason, globalThis.__obscura_frameId || 0);
+    _consoleFn("error", ["Uncaught (in promise)", reason]);
+  }
   // Browsers report an unhandled rejection without terminating the page's
   // event loop. Returning true tells deno_core that the host delivered it.
   return true;
@@ -12688,6 +12840,59 @@ globalThis.performance = globalThis.performance || {
       return data.detail;
     }
   };
+  // The document's own navigation entry, which Chrome lists from the first
+  // script on: web-vitals and analytics read their timings off
+  // getEntriesByType('navigation')[0], and threw on an empty list.
+  const navigationTimings = [
+    'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd', 'fetchStart',
+    'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd', 'secureConnectionStart',
+    'requestStart', 'responseStart', 'responseEnd', 'domInteractive', 'domContentLoadedEventStart',
+    'domContentLoadedEventEnd', 'domComplete', 'loadEventStart', 'loadEventEnd',
+  ];
+  // Milliseconds from navigationStart; 0 for what has not happened yet.
+  function sinceNavigation(name) {
+    const timing = perf.timing;
+    const at = timing ? +timing[name] : 0;
+    return at ? Math.max(0, at - (+timing.navigationStart || perf.timeOrigin || 0)) : 0;
+  }
+  globalThis.PerformanceNavigationTiming = class PerformanceNavigationTiming extends PerformanceEntry {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get initiatorType() { state(entryState, this); return 'navigation'; }
+    get nextHopProtocol() { state(entryState, this); return 'http/1.1'; }
+    get type() { state(entryState, this); return 'navigate'; }
+    get redirectCount() { state(entryState, this); return 0; }
+    get workerStart() { state(entryState, this); return 0; }
+    get transferSize() { state(entryState, this); return 0; }
+    get encodedBodySize() { state(entryState, this); return 0; }
+    get decodedBodySize() { state(entryState, this); return 0; }
+    get serverTiming() { state(entryState, this); return []; }
+    toJSON() {
+      const json = super.toJSON();
+      delete json.detail;
+      for (const name of ['initiatorType', 'nextHopProtocol', 'type', 'redirectCount', 'workerStart',
+        'transferSize', 'encodedBodySize', 'decodedBodySize', ...navigationTimings]) json[name] = this[name];
+      return json;
+    }
+  };
+  for (const name of navigationTimings) {
+    Object.defineProperty(PerformanceNavigationTiming.prototype, name, {
+      configurable: true, enumerable: true,
+      get() { state(entryState, this); return sinceNavigation(name); },
+    });
+  }
+  let navigationEntry;
+  function navigationEntries() {
+    if (!navigationEntry) {
+      navigationEntry = Object.create(PerformanceNavigationTiming.prototype);
+      entryState.set(navigationEntry, {
+        get name() { return String(globalThis.location?.href ?? ''); },
+        entryType: 'navigation', startTime: 0,
+        get duration() { return sinceNavigation('loadEventEnd'); },
+        detail: null,
+      });
+    }
+    return [navigationEntry];
+  }
   function queueDelivery() {
     if (deliveryPending) return;
     deliveryPending = true;
@@ -12773,17 +12978,20 @@ globalThis.performance = globalThis.performance || {
   }
   perf.clearMarks = function clearMarks(name = undefined) { checkPerformance(this); clear('mark', name); };
   perf.clearMeasures = function clearMeasures(name = undefined) { checkPerformance(this); clear('measure', name); };
-  perf.getEntries = function getEntries() { checkPerformance(this); return entries(allEntries()); };
+  perf.getEntries = function getEntries() {
+    checkPerformance(this);
+    return entries(navigationEntries().concat(allEntries()));
+  };
   perf.getEntriesByType = function getEntriesByType(type) {
     checkPerformance(this);
     if (!arguments.length) throw new TypeError('An entry type is required');
     type = string(type);
-    return entries(buffers[type] || []);
+    return type === 'navigation' ? navigationEntries() : entries(buffers[type] || []);
   };
   perf.getEntriesByName = function getEntriesByName(name, type = undefined) {
     checkPerformance(this);
     if (!arguments.length) throw new TypeError('An entry name is required');
-    return entries(allEntries(), string(name), type === undefined ? undefined : string(type));
+    return entries(navigationEntries().concat(allEntries()), string(name), type === undefined ? undefined : string(type));
   };
   globalThis.PerformanceObserverEntryList = class PerformanceObserverEntryList {
     constructor() { throw new TypeError('Illegal constructor'); }
@@ -14082,7 +14290,14 @@ globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {
 };
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
-globalThis.HTMLScriptElement = Element;
+// <script> has its own brand for HTMLScriptElement.supports(), which import
+// map polyfills (es-module-shims, remix's) read to learn that import maps
+// work natively; without it remix.run threw before rendering anything.
+globalThis.HTMLScriptElement = class HTMLScriptElement extends Element {
+  static supports(type) {
+    return type === 'classic' || type === 'module' || type === 'importmap';
+  }
+};
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
 globalThis.HTMLMetaElement = class HTMLMetaElement extends Element {
@@ -14154,11 +14369,63 @@ globalThis.HTMLFieldSetElement = Element;
 globalThis.HTMLLegendElement = Element;
 globalThis.HTMLProgressElement = Element;
 globalThis.HTMLDetailsElement = Element;
+// `value` belongs to form controls and a few value-bearing elements, not to
+// every element: libraries tell a node from a ref object by
+// `"value" in el || "current" in el` (egjs, under Flicking carousels), and
+// with `value` on Element every <div> looked like a ref holding nothing,
+// which emptied drom.ru's home page. Elements that have it get their brand.
+{
+  const valueDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'value');
+  const brand = (name) => {
+    const cls = { [name]: class extends Element {} }[name];
+    Object.defineProperty(cls.prototype, 'value', valueDescriptor);
+    return cls;
+  };
+  for (const name of ['HTMLButtonElement', 'HTMLSelectElement', 'HTMLOptionElement', 'HTMLProgressElement',
+    'HTMLMeterElement', 'HTMLOutputElement', 'HTMLDataElement']) {
+    globalThis[name] = brand(name);
+  }
+  Object.defineProperty(HTMLTextAreaElement.prototype, 'value', valueDescriptor);
+  // <li> already reflects its integer value.
+  delete Element.prototype.value;
+  // Interfaces that were missing altogether: a script naming one threw a
+  // ReferenceError (webflow.com's consent manager on HTMLBaseElement).
+  for (const name of ['HTMLAreaElement', 'HTMLBaseElement', 'HTMLDirectoryElement', 'HTMLDListElement',
+    'HTMLEmbedElement', 'HTMLFontElement', 'HTMLFrameElement', 'HTMLFrameSetElement', 'HTMLMapElement',
+    'HTMLMarqueeElement', 'HTMLMenuElement', 'HTMLModElement', 'HTMLObjectElement', 'HTMLOptGroupElement',
+    'HTMLParamElement', 'HTMLPictureElement', 'HTMLQuoteElement', 'HTMLSourceElement',
+    'HTMLTableCaptionElement', 'HTMLTableCellElement', 'HTMLTableColElement', 'HTMLTableRowElement',
+    'HTMLTableSectionElement', 'HTMLTimeElement', 'HTMLTitleElement']) {
+    if (typeof globalThis[name] === 'undefined') globalThis[name] = { [name]: class extends Element {} }[name];
+  }
+  if (typeof globalThis.HTMLDocument === 'undefined') globalThis.HTMLDocument = Document;
+}
+// HTML tag names whose elements are instances of their own interface above.
+var _valueElementClasses = {
+  BUTTON: 'HTMLButtonElement', SELECT: 'HTMLSelectElement', OPTION: 'HTMLOptionElement',
+  PROGRESS: 'HTMLProgressElement', METER: 'HTMLMeterElement', OUTPUT: 'HTMLOutputElement',
+  DATA: 'HTMLDataElement', AREA: 'HTMLAreaElement', BASE: 'HTMLBaseElement', DIR: 'HTMLDirectoryElement',
+  DL: 'HTMLDListElement', EMBED: 'HTMLEmbedElement', FONT: 'HTMLFontElement', FRAME: 'HTMLFrameElement',
+  FRAMESET: 'HTMLFrameSetElement', MAP: 'HTMLMapElement', MARQUEE: 'HTMLMarqueeElement',
+  MENU: 'HTMLMenuElement', DEL: 'HTMLModElement', INS: 'HTMLModElement', OBJECT: 'HTMLObjectElement',
+  OPTGROUP: 'HTMLOptGroupElement', PARAM: 'HTMLParamElement', PICTURE: 'HTMLPictureElement',
+  Q: 'HTMLQuoteElement', BLOCKQUOTE: 'HTMLQuoteElement', SOURCE: 'HTMLSourceElement',
+  CAPTION: 'HTMLTableCaptionElement', TD: 'HTMLTableCellElement', TH: 'HTMLTableCellElement',
+  COL: 'HTMLTableColElement', COLGROUP: 'HTMLTableColElement', TR: 'HTMLTableRowElement',
+  THEAD: 'HTMLTableSectionElement', TBODY: 'HTMLTableSectionElement', TFOOT: 'HTMLTableSectionElement',
+  TIME: 'HTMLTimeElement', TITLE: 'HTMLTitleElement',
+};
 globalThis.HTMLDialogElement = Element;
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
 // baseVal is writable. Used by the SVG-aware get className()/get href() above.
-function SVGAnimatedString(el, attr, fallbackAttr) {
+// It is a global like in Chrome (pages test `className instanceof
+// SVGAnimatedString`), and like there only the engine can construct one.
+const _svgAnimatedStringKey = Symbol("SVGAnimatedString");
+function SVGAnimatedString(key, el, attr, fallbackAttr) {
+  if (key !== _svgAnimatedStringKey) {
+    throw new TypeError("Failed to construct 'SVGAnimatedString': Illegal constructor");
+  }
   this._el = el;
   this._attr = attr;
   this._fallback = fallbackAttr || null;
@@ -14179,6 +14446,7 @@ Object.defineProperty(SVGAnimatedString.prototype, 'animVal', {
 });
 Object.defineProperty(SVGAnimatedString.prototype, Symbol.toStringTag, { value: 'SVGAnimatedString', configurable: true });
 _markNative(SVGAnimatedString);
+globalThis.SVGAnimatedString = SVGAnimatedString;
 
 class SVGElement extends Element {
   get [Symbol.toStringTag]() { return "SVGElement"; }
@@ -15883,6 +16151,19 @@ class _Canvas2D {
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
     const str = String(text);
+    // The glyph box is 7*scale tall with its bottom on y, i.e. drawn for the
+    // default 'alphabetic' baseline. Shift it for the others: with 'top', text
+    // drawn at y=0 used to land entirely above the canvas, so the canvas stayed
+    // blank. axe-core draws exactly that to tell icon ligatures from text, saw
+    // nothing, treated every text node as an icon and skipped color-contrast.
+    const baseline = this.textBaseline;
+    if (baseline === 'top' || baseline === 'hanging') y += 7 * scale;
+    else if (baseline === 'middle') y += Math.round(3.5 * scale);
+    else if (baseline === 'bottom' || baseline === 'ideographic') y -= 2 * scale;
+    // Same for textAlign, using the advance measureText reports (left-to-right).
+    const width = str.length * 6 * scale;
+    if (this.textAlign === 'center') x -= width / 2;
+    else if (this.textAlign === 'right' || this.textAlign === 'end') x -= width;
     let cx = Math.round(x);
     for (let i = 0; i < str.length; i++) {
       const code = str.charCodeAt(i);
@@ -16137,6 +16418,13 @@ class _Canvas2D {
   createConicGradient() { return { addColorStop(){} }; }
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
+// The 2D context's interface: in browsers its methods sit on
+// CanvasRenderingContext2D.prototype, where canvas fingerprinting and bot
+// detection hook them (detmir.ru wraps prototype.arc in a Proxy, threw on
+// undefined, and the rest of its app setup never ran).
+Object.defineProperty(_Canvas2D, 'name', { value: 'CanvasRenderingContext2D' });
+Object.defineProperty(_Canvas2D.prototype, Symbol.toStringTag, { value: 'CanvasRenderingContext2D', configurable: true });
+globalThis.CanvasRenderingContext2D = _Canvas2D;
 
 class HTMLCanvasElement extends Element {
   get width() {
@@ -16455,8 +16743,9 @@ globalThis.Worker = class Worker {
       const blob = globalThis.__blobStore?.[url];
       if (blob) {
         worker._code = blob;
+        worker._base = globalThis.location?.href || '';
         // Auto-start on next tick so caller can set onmessage first.
-        setTimeout(() => worker._autoRun(), 0);
+        setTimeout(() => worker._prefetchImports().then(() => worker._autoRun()), 0);
         return;
       }
       // Resolve relative URLs against the current page.
@@ -16467,14 +16756,54 @@ globalThis.Worker = class Worker {
         try {
           const resp = await fetch(resolvedUrl);
           worker._code = await resp.text();
+          worker._base = resolvedUrl;
+          await worker._prefetchImports();
           if (!worker._terminated) worker._autoRun();
         } catch(e) { if (worker.onerror) worker.onerror(e); }
       })();
     }
   }
+  // importScripts() is synchronous and this worker runs in the page's
+  // event loop, so the scripts a worker names as string literals are
+  // fetched before it starts; blob: and data: URLs need no fetch. Any other
+  // URL fails as a network error would.
+  async _prefetchImports() {
+    this._imports = new Map();
+    const pattern = /importScripts\s*\(([^)]*)\)/g;
+    const urls = new Set();
+    for (const call of String(this._code || '').matchAll(pattern)) {
+      for (const literal of call[1].matchAll(/(["'`])([^"'`]+)\1/g)) urls.add(literal[2]);
+    }
+    await Promise.all([...urls].map(async (raw) => {
+      let url;
+      try { url = new URL(raw, this._base || undefined).href; } catch (e) { return; }
+      if (url.startsWith('blob:') || url.startsWith('data:')) return;
+      try {
+        const response = await fetch(url);
+        if (response.ok) this._imports.set(url, await response.text());
+      } catch (e) {}
+    }));
+  }
+  _importScripts(scope, urls) {
+    const run = new Function('scope', 'source', 'with (scope) { eval(source); }');
+    for (const raw of urls) {
+      let url;
+      try { url = new URL(String(raw), this._base || undefined).href; }
+      catch (e) { throw new DOMException("Failed to execute 'importScripts': The URL '" + raw + "' is invalid.", 'SyntaxError'); }
+      let source;
+      if (url.startsWith('blob:')) source = globalThis.__blobStore?.[url];
+      else if (url.startsWith('data:')) { try { source = _decodeDataScriptUrl(url); } catch (e) {} }
+      else source = this._imports?.get(url);
+      if (source === undefined) {
+        throw new DOMException("Failed to execute 'importScripts': The script at '" + url + "' failed to load.", 'NetworkError');
+      }
+      run.call(scope, scope, source);
+    }
+  }
   _makeScope() {
     const worker = this;
     const scope = {
+      importScripts: (...urls) => worker._importScripts(scope, urls),
       onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
@@ -16603,20 +16932,26 @@ URL.createObjectURL = function(blob) {
     // failed (net::ERR_FAILED), which broke AWS WAF's proof-of-work worker.
     // The obscura Blob materializes _bytes in its constructor; fall back to
     // the async text() store only for foreign Blob shims without _bytes.
+    // The module loader reads blob: modules from the native side.
+    const keep = (text) => {
+      globalThis.__blobStore[id] = text;
+      if (typeof __obscuraCore.ops.op_blob_register === 'function') __obscuraCore.ops.op_blob_register(id, text);
+    };
     if (blob._bytes) {
       let text = '';
       try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
-      globalThis.__blobStore[id] = text;
+      keep(text);
     } else if (typeof blob.text === 'function') {
-      blob.text().then(text => { globalThis.__blobStore[id] = text; });
+      blob.text().then(keep);
     } else {
-      globalThis.__blobStore[id] = '';
+      keep('');
     }
     return id;
   }
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
+  if (typeof __obscuraCore.ops.op_blob_revoke === 'function') __obscuraCore.ops.op_blob_revoke(String(url));
 };
 
 // Window-level scrolling (issue #468). #431 gave elements functional
@@ -17297,6 +17632,7 @@ if (typeof DOMRect === 'undefined') {
     static fromRect(r={}) { return new DOMRect(r.x,r.y,r.width,r.height); }
   };
 }
+if (typeof DOMRectReadOnly === 'undefined') globalThis.DOMRectReadOnly = globalThis.DOMRect;
 
 if (typeof DOMRectList === 'undefined') {
   globalThis.DOMRectList = class DOMRectList {
@@ -17331,6 +17667,11 @@ if (typeof DOMMatrix === 'undefined') {
     transformPoint(p) { return new DOMPoint(p?.x||0,p?.y||0); }
   };
 }
+// The read-only geometry interfaces, which scripts name for instanceof
+// checks and feature tests (cloudflare.com threw on DOMMatrixReadOnly).
+if (typeof DOMMatrixReadOnly === 'undefined') globalThis.DOMMatrixReadOnly = globalThis.DOMMatrix;
+if (typeof DOMPointReadOnly === 'undefined') globalThis.DOMPointReadOnly = globalThis.DOMPoint;
+if (typeof WebKitCSSMatrix === 'undefined') globalThis.WebKitCSSMatrix = globalThis.DOMMatrix;
 
 if (typeof Image === 'undefined') {
   // In a real browser `new Image()` is `document.createElement('img')`, i.e. a
@@ -17641,6 +17982,24 @@ if (typeof BroadcastChannel === 'undefined') {
   // EventTarget is currently Node-backed in this runtime; link the prototype
   // without invoking Node's DOM-node constructor or exposing a fake `_nid`.
   Object.setPrototypeOf(globalThis.BroadcastChannel.prototype, globalThis.EventTarget.prototype);
+}
+
+// What navigator.permissions.query() resolves to. Chrome's is an
+// EventTarget: VueUse's usePermission listens for its `change`, and a plain
+// object made that throw, which Nuxt turned into its 500 page.
+globalThis.PermissionStatus = class PermissionStatus {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get [Symbol.toStringTag]() { return 'PermissionStatus'; }
+};
+Object.setPrototypeOf(globalThis.PermissionStatus.prototype, globalThis.EventTarget.prototype);
+function _permissionStatus(name, state) {
+  const status = Object.create(globalThis.PermissionStatus.prototype);
+  Object.defineProperties(status, {
+    name: { value: String(name ?? ''), enumerable: true },
+    state: { value: state, enumerable: true },
+    onchange: { value: null, writable: true, enumerable: true },
+  });
+  return status;
 }
 
 globalThis.MediaQueryListEvent = class MediaQueryListEvent extends Event {

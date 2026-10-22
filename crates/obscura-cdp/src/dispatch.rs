@@ -60,6 +60,10 @@ pub struct CdpContext {
     /// events when the client attaches; Page.enable emits them once per page
     /// so clients waiting on the initial load (chromiumoxide, #833) unblock.
     pub nav_events_emitted: std::collections::HashSet<String>,
+    /// Navigations that returned at DOMContentLoaded while their page kept
+    /// loading, keyed by page id: the event session, frame id and loader id of
+    /// the load lifecycle events held back until the page fires `load`.
+    pub deferred_loads: HashMap<String, (Option<String>, String, String)>,
     /// Child frame ids already reported to the client, per page, so each frame
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
@@ -178,6 +182,7 @@ impl CdpContext {
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
+            deferred_loads: HashMap::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
             dom_documents: HashMap::new(),
@@ -870,6 +875,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     drain_runtime_events(ctx);
     drain_binding_calls(ctx);
     drain_frame_events(ctx);
+    crate::domains::page::emit_deferred_load_events(ctx);
 
     match result {
         Ok(value) => CdpResponse::success(req.id, value, req.session_id.clone()),

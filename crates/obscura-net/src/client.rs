@@ -34,31 +34,41 @@ fn configured_root_paths() -> Vec<std::path::PathBuf> {
     paths
 }
 
+fn load_configured_root_certificates() -> Vec<reqwest::Certificate> {
+    let mut certificates = Vec::new();
+    for path in configured_root_paths() {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "failed to read CA certificate file");
+                continue;
+            }
+        };
+        match reqwest::Certificate::from_pem_bundle(&bytes) {
+            Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
+            _ => match reqwest::Certificate::from_der(&bytes) {
+                Ok(certificate) => certificates.push(certificate),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
+                }
+            },
+        }
+    }
+    certificates
+}
+
+#[cfg(not(test))]
 fn configured_root_certificates() -> &'static [reqwest::Certificate] {
     static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+    ROOTS.get_or_init(load_configured_root_certificates)
+}
 
-    ROOTS.get_or_init(|| {
-        let mut certificates = Vec::new();
-        for path in configured_root_paths() {
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "failed to read CA certificate file");
-                    continue;
-                }
-            };
-            match reqwest::Certificate::from_pem_bundle(&bytes) {
-                Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
-                _ => match reqwest::Certificate::from_der(&bytes) {
-                    Ok(certificate) => certificates.push(certificate),
-                    Err(error) => {
-                        tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
-                    }
-                },
-            }
-        }
-        certificates
-    })
+/// Read afresh for each client in tests: tests that each point SSL_CERT_FILE
+/// or SSL_CERT_DIR at their own CA share one process, and a cached set
+/// trusted only the first test's CA.
+#[cfg(test)]
+fn configured_root_certificates() -> &'static [reqwest::Certificate] {
+    Box::leak(load_configured_root_certificates().into_boxed_slice())
 }
 
 /// Whether SSL_CERT_FILE / SSL_CERT_DIR request a custom TLS trust store. A
@@ -594,6 +604,83 @@ impl Default for CallbackRegistry {
 
 pub use obscura_ssrf::{env_allows_private_network, is_forbidden_ip};
 
+/// Budget for opening a connection (TCP connect plus TLS handshake), separate
+/// from the 30s whole-request timeout, so it never cuts a slow download short.
+/// Without it a host that silently drops packets (an ad network blocked on the
+/// visitor's network) holds its request for the full 30s; the parser-discovered
+/// script batch waits on its slowest member, so on habr.com one blackholed
+/// `<script async>` used up the page's whole script budget and no script ran.
+/// OBSCURA_CONNECT_TIMEOUT_MS overrides the 10s default.
+pub fn connect_timeout() -> Duration {
+    let timeout_ms = std::env::var("OBSCURA_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000);
+    Duration::from_millis(timeout_ms)
+}
+
+/// Whether the default (non-stealth) clients may negotiate HTTP/2. Off unless
+/// OBSCURA_HTTP2=1: with HTTP/2 on, a page reusing its context's pooled
+/// connections saw new requests to some third-party hosts (cdn.usefathom.com,
+/// media.bitterbrains.com on vuejs.org) go unanswered after the previous
+/// navigation reset its unfinished streams on the same connection. Over
+/// HTTP/1.1 the same ten-page run had every request answered, and finished
+/// faster than with a fresh context per page.
+/// `OBSCURA_INSECURE_TLS=1` accepts any certificate, for a staging site on
+/// a self-signed one. Off by default.
+pub fn accept_invalid_certs() -> bool {
+    std::env::var("OBSCURA_INSECURE_TLS").is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+pub fn http2_enabled() -> bool {
+    std::env::var("OBSCURA_HTTP2").is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// Longest silence allowed while waiting for a subresource's response headers
+/// or between two chunks of any response body. A slow download that keeps
+/// delivering bytes still runs to the whole-request timeout, while a server
+/// that accepted the request and then went quiet fails here: habr.com's own
+/// `/mt/t.js` intermittently never answers and held the load event for the
+/// page's full 30s script budget. OBSCURA_READ_TIMEOUT_MS overrides the 10s
+/// default.
+///
+/// It is applied per request, never as reqwest's `read_timeout`: that one
+/// times reads on the connection, so it also fires on a pooled connection that
+/// is merely idle between page loads, and on HTTP/2 it then fails every
+/// request multiplexed on that connection.
+pub fn read_timeout() -> Duration {
+    let timeout_ms = std::env::var("OBSCURA_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000);
+    Duration::from_millis(timeout_ms)
+}
+
+/// OBSCURA_THIRD_PARTY_TIMEOUT_MS: a lower stall limit for requests to
+/// another site than the page's. Unset by default, so every request gets
+/// `read_timeout`. A crawler sets it low: trackers and ad hosts that never
+/// answer (common where they are blocked) otherwise hold a page that defers
+/// their script for the whole stall limit.
+pub fn third_party_timeout() -> Option<Duration> {
+    std::env::var("OBSCURA_THIRD_PARTY_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+}
+
+/// The stall limit for a request from the document at `initiator` to
+/// `target`: `read_timeout`, capped by `third_party_timeout` across sites.
+pub fn stall_timeout(initiator: Option<&Url>, target: &Url) -> Duration {
+    capped_stall(read_timeout(), third_party_timeout(), initiator, target)
+}
+
+fn capped_stall(stall: Duration, third_party: Option<Duration>, initiator: Option<&Url>, target: &Url) -> Duration {
+    match (third_party, initiator) {
+        (Some(limit), Some(initiator)) if !crate::cookies::same_site(initiator, target) => stall.min(limit),
+        _ => stall,
+    }
+}
+
 /// DNS resolver that performs the lookup and then rejects the whole request if
 /// ANY resolved address is in the SSRF deny-set. This closes the DNS-rebinding
 /// bypass a host-string check alone cannot: a public name that resolves to
@@ -620,8 +707,16 @@ impl Resolve for SsrfGuardResolver {
         let allow = self.allow_private || env_allows_private_network();
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
-                .await
+            let started = std::time::Instant::now();
+            let looked_up = tokio::net::lookup_host((host.as_str(), 0)).await;
+            tracing::debug!(
+                target: "obscura_net::dns",
+                host = %host,
+                ms = started.elapsed().as_millis() as u64,
+                ok = looked_up.is_ok(),
+                "resolved"
+            );
+            let addrs: Vec<SocketAddr> = looked_up
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
                 .collect();
             if !allow {
@@ -815,6 +910,7 @@ async fn read_reqwest_body_limited(
     mut response: reqwest::Response,
     url: &Url,
     limit: usize,
+    stall: Duration,
 ) -> Result<Vec<u8>, ObscuraNetError> {
     reject_oversized_content_length(response.headers(), url, limit)?;
     let capacity = response
@@ -823,9 +919,19 @@ async fn read_reqwest_body_limited(
         .unwrap_or(0)
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
-    })? {
+    loop {
+        let Ok(chunk) = tokio::time::timeout(stall, response.chunk()).await else {
+            return Err(ObscuraNetError::Network(format!(
+                "{url}: no body data for {}ms",
+                stall.as_millis()
+            )));
+        };
+        let Some(chunk) = chunk.map_err(|error| {
+            ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
+        })?
+        else {
+            break;
+        };
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
         }
@@ -845,7 +951,9 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
-    resource_loader: std::sync::Mutex<ResourceLoaderState>,
+    /// Subresource cache and in-flight coalescing; one per process when
+    /// `OBSCURA_RESOURCE_CACHE_SHARED` asks for it.
+    resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
@@ -855,14 +963,64 @@ pub struct ObscuraHttpClient {
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
 const RESOURCE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+fn env_flag(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// OBSCURA_RESOURCE_CACHE_SHARED=1: every client in the process shares one
+/// subresource cache, so a crawler's render threads download a site's
+/// scripts and styles once instead of once per thread and page.
+fn resource_loader_for_new_client() -> Arc<std::sync::Mutex<ResourceLoaderState>> {
+    static SHARED: OnceLock<Arc<std::sync::Mutex<ResourceLoaderState>>> = OnceLock::new();
+    if env_flag("OBSCURA_RESOURCE_CACHE_SHARED") {
+        SHARED.get_or_init(Default::default).clone()
+    } else {
+        Default::default()
+    }
+}
+
+/// (entries, bytes) the cache holds: OBSCURA_RESOURCE_CACHE_MB sets the
+/// size, 64 MB and 256 entries by default; entries scale with the size.
+fn resource_cache_limits() -> (usize, usize) {
+    static LIMITS: OnceLock<(usize, usize)> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        match std::env::var("OBSCURA_RESOURCE_CACHE_MB").ok().and_then(|value| value.trim().parse::<usize>().ok()) {
+            Some(megabytes) if megabytes > 0 => {
+                let bytes = megabytes * 1024 * 1024;
+                (RESOURCE_CACHE_MAX_ENTRIES.max(megabytes * 16), bytes)
+            }
+            _ => (RESOURCE_CACHE_MAX_ENTRIES, RESOURCE_CACHE_MAX_BYTES),
+        }
+    })
+}
+
+/// OBSCURA_RESOURCE_CACHE_MIN_TTL_MS: keep scripts, stylesheets and fonts
+/// that do not say how long they stay fresh (no `max-age`, or `no-cache`)
+/// for this long anyway. `no-store` is still honoured. For a crawl that
+/// takes a snapshot of a site, re-downloading the same bundle for every
+/// page is the cost of a cache a browser would revalidate.
+fn resource_cache_min_ttl() -> Option<Duration> {
+    static MIN_TTL: OnceLock<Option<Duration>> = OnceLock::new();
+    *MIN_TTL.get_or_init(|| {
+        std::env::var("OBSCURA_RESOURCE_CACHE_MIN_TTL_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ResourceCacheKey {
     url: String,
     resource_type: ResourceType,
     mode: RequestMode,
     credentials: RequestCredentials,
+    /// The initiator's origin, not its URL: CORS and credentials depend on
+    /// the origin, and keying by page URL made every page of a site miss
+    /// the cache for the bundle all of them load. The referrer is left out
+    /// for the same reason, as browsers do.
     initiator: Option<String>,
-    referrer: Option<String>,
     user_agent: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
@@ -933,17 +1091,16 @@ impl ResourceCache {
     }
 
     fn insert(&mut self, key: ResourceCacheKey, response: Response, lifetime: Duration) {
+        let (max_entries, max_bytes) = resource_cache_limits();
         let response_bytes = response.body.len();
-        if response_bytes > RESOURCE_CACHE_MAX_BYTES {
+        if response_bytes > max_bytes {
             return;
         }
         if let Some(previous) = self.entries.remove(&key) {
             self.body_bytes = self.body_bytes.saturating_sub(previous.response.body.len());
             self.insertion_order.retain(|queued| queued != &key);
         }
-        while self.entries.len() >= RESOURCE_CACHE_MAX_ENTRIES
-            || self.body_bytes.saturating_add(response_bytes) > RESOURCE_CACHE_MAX_BYTES
-        {
+        while self.entries.len() >= max_entries || self.body_bytes.saturating_add(response_bytes) > max_bytes {
             let Some(oldest) = self.insertion_order.pop_front() else {
                 break;
             };
@@ -961,6 +1118,22 @@ impl ResourceCache {
             },
         );
     }
+}
+
+/// Whether `resource_cache_min_ttl` may keep a response that
+/// `response_cache_lifetime` does not: a static subresource the server did
+/// not forbid storing.
+fn min_ttl_applies(resource_type: ResourceType, response: &Response) -> bool {
+    matches!(resource_type, ResourceType::Script | ResourceType::Stylesheet | ResourceType::Font)
+        && (200..300).contains(&response.status)
+        && response.redirected_from.is_empty()
+        && response.header("set-cookie").is_none()
+        && !response
+            .header("vary")
+            .is_some_and(|vary| vary.split(',').any(|name| name.trim() == "*"))
+        && !response
+            .header("cache-control")
+            .is_some_and(|value| value.split(',').any(|directive| directive.trim().eq_ignore_ascii_case("no-store")))
 }
 
 fn response_cache_lifetime(response: &Response) -> Option<Duration> {
@@ -1060,7 +1233,7 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
-            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
+            resource_loader: resource_loader_for_new_client(),
             allow_private_network,
         }
     }
@@ -1070,13 +1243,21 @@ impl ObscuraHttpClient {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
                 .timeout(self.timeout)
-                .danger_accept_invalid_certs(false)
+                .connect_timeout(connect_timeout())
+                .danger_accept_invalid_certs(accept_invalid_certs())
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.
                 .http1_allow_obsolete_multiline_headers_in_responses(true)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
-;
+                // hyper's HTTP/2 default is a 64 KiB stream window, which caps a
+                // single download at 64 KiB per round trip. Use Chrome's windows
+                // so large scripts are not throttled on a high-latency path.
+                .http2_initial_stream_window_size(6 * 1024 * 1024)
+                .http2_initial_connection_window_size(15 * 1024 * 1024);
+            if !http2_enabled() {
+                builder = builder.http1_only();
+            }
 
             if std::env::var_os("SSL_CERT_FILE").is_some()
                 || std::env::var_os("SSL_CERT_DIR").is_some()
@@ -1185,7 +1366,7 @@ impl ObscuraHttpClient {
             || body.is_some()
             || request.resource_type == ResourceType::Document
             || !matches!(url.scheme(), "http" | "https")
-            || self.interceptor.read().await.is_some()
+            || self.interceptor.read().await.as_ref().is_some_and(|interceptor| !interceptor.documents_only())
         {
             return None;
         }
@@ -1206,7 +1387,12 @@ impl ObscuraHttpClient {
         }) {
             return None;
         }
-        if request.sends_credentials_to(url)
+        // A crawl that keeps static subresources anyway (min TTL) keeps them
+        // whatever cookies ride along: bundles do not vary by session.
+        let static_for_crawl = resource_cache_min_ttl().is_some()
+            && matches!(request.resource_type, ResourceType::Script | ResourceType::Stylesheet | ResourceType::Font);
+        if !static_for_crawl
+            && request.sends_credentials_to(url)
             && !self
                 .cookie_jar
                 .get_cookie_header_in_context(url, SameSiteContext::SameSite)
@@ -1219,8 +1405,7 @@ impl ObscuraHttpClient {
             resource_type: request.resource_type,
             mode: request.mode,
             credentials: request.credentials,
-            initiator: request.initiator.as_ref().map(ToString::to_string),
-            referrer: request.referrer.as_ref().map(ToString::to_string),
+            initiator: request.initiator.as_ref().map(|initiator| initiator.origin().ascii_serialization()),
             user_agent: self.user_agent.read().await.clone(),
             extra_headers,
             max_response_bytes: request.max_response_bytes,
@@ -1319,6 +1504,7 @@ impl ObscuraHttpClient {
                     sender,
                     finished: false,
                 };
+                let request_type = request.resource_type;
                 let result = self
                     .fetch_with_profile_uncached(
                         initial_method,
@@ -1329,7 +1515,9 @@ impl ObscuraHttpClient {
                     )
                     .await;
                 let shared_outcome = match &result {
-                    Ok(response) => match response_cache_lifetime(response) {
+                    Ok(response) => match response_cache_lifetime(response).or_else(|| {
+                        resource_cache_min_ttl().filter(|_| min_ttl_applies(request_type, response))
+                    }) {
                         Some(lifetime) => {
                             self.resource_loader.lock().unwrap().cache.insert(
                                 cache_key,
@@ -1575,7 +1763,42 @@ impl ObscuraHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = req_builder.send().await.map_err(|e| {
+            let stall = stall_timeout(request.initiator.as_ref(), &current_url);
+            let sent_at = std::time::Instant::now();
+            tracing::debug!(target: "obscura_net::request", url = %current_url, kind = ?request.resource_type, "send");
+            // A subresource whose server never answers fails after the stall
+            // timeout instead of holding the page to the whole-request one.
+            // The main document keeps the full budget: a slow site is still a
+            // site, not a stalled tracker.
+            let sent = if request.resource_type == ResourceType::Document {
+                req_builder.send().await
+            } else {
+                match tokio::time::timeout(stall, req_builder.send()).await {
+                    Ok(sent) => sent,
+                    Err(_) => {
+                        tracing::debug!(
+                            target: "obscura_net::request",
+                            url = %current_url,
+                            kind = ?request.resource_type,
+                            ms = sent_at.elapsed().as_millis() as u64,
+                            "no response"
+                        );
+                        return Err(ObscuraNetError::Network(format!(
+                            "{current_url}: no response within {}ms",
+                            stall.as_millis()
+                        )));
+                    }
+                }
+            };
+            tracing::debug!(
+                target: "obscura_net::request",
+                url = %current_url,
+                kind = ?request.resource_type,
+                ms = sent_at.elapsed().as_millis() as u64,
+                ok = sent.is_ok(),
+                "headers"
+            );
+            let resp = sent.map_err(|e| {
                 ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
             })?;
 
@@ -1633,6 +1856,7 @@ impl ObscuraHttpClient {
                 resp,
                 &current_url,
                 request.max_response_bytes,
+                stall,
             )
             .await?;
             drop(in_flight);
@@ -1735,7 +1959,6 @@ mod resource_cache_tests {
             mode: RequestMode::NoCors,
             credentials: RequestCredentials::Omit,
             initiator: None,
-            referrer: None,
             user_agent: "cache-test".into(),
             extra_headers: Vec::new(),
             max_response_bytes: 1024,
@@ -2698,6 +2921,25 @@ mod ssrf_tests {
     }
 
     #[tokio::test]
+    async fn pages_of_one_origin_share_cached_subresources() {
+        // The cache is keyed by the initiator's origin: every page of a site
+        // reuses its bundle instead of downloading it again.
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Cache-Control: public, max-age=3600\r\n",
+        )
+        .await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        for page in ["/a", "/b?x=1", "/c/d"] {
+            let initiator = url.join(page).unwrap();
+            let request = ResourceRequest::module_script(&initiator, &initiator);
+            let response = client.fetch_resource_with_callbacks(&url, request, None).await.unwrap();
+            assert_eq!(response.status, 200);
+        }
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn distinct_subresource_urls_do_not_coalesce() {
         let (url, network_requests) =
             cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
@@ -2980,5 +3222,23 @@ mod cert_env_tests {
             None,
             Some(OsStr::new("/etc/ssl/certs"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    #[test]
+    fn third_party_stall_applies_across_sites_only() {
+        let page = Url::parse("https://vuejs.org/guide/").unwrap();
+        let own = Url::parse("https://cdn.vuejs.org/app.js").unwrap();
+        let tracker = Url::parse("https://cdn.usefathom.com/script.js").unwrap();
+        let ten = Duration::from_secs(10);
+        let three = Some(Duration::from_secs(3));
+        assert_eq!(capped_stall(ten, three, Some(&page), &tracker), Duration::from_secs(3));
+        assert_eq!(capped_stall(ten, three, Some(&page), &own), ten);
+        assert_eq!(capped_stall(ten, three, None, &tracker), ten);
+        assert_eq!(capped_stall(ten, None, Some(&page), &tracker), ten);
     }
 }

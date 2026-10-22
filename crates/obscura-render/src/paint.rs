@@ -1767,6 +1767,10 @@ impl PreparedRender {
         let style = self.layout.styles.get(&id)?;
         let rect = self.layout.rects.get(&id);
         let mut out = non_geometric_computed_style(style);
+        out.insert(
+            "background-image",
+            background_image_css(style, self.base_url()),
+        );
         out.insert("font-size", css_px(style.font_size.unwrap_or(16.0)));
         out.insert(
             "font-weight",
@@ -2467,6 +2471,62 @@ fn css_color([r, g, b, a]: [u8; 4]) -> String {
         format!("rgb({r}, {g}, {b})")
     } else {
         format!("rgba({r}, {g}, {b}, {})", css_number(a as f32 / 255.0))
+    }
+}
+
+/// Computed `background-image`: `none`, or the cascaded gradient layers and
+/// the resolved `url()` image. It used to be missing from the snapshot, so
+/// scripts read `""`, which readers such as axe-core take for "has an image"
+/// (they test `!== 'none'`). Layer order is approximate (gradients, then the
+/// image) because the parsed style keeps the two apart.
+fn background_image_css(style: &crate::LayoutStyle, base_url: Option<&str>) -> String {
+    use crate::BackgroundGradientLayer as Layer;
+    let stops = |stops: &[([u8; 4], Option<f32>)]| {
+        stops
+            .iter()
+            .map(|(color, at)| match at {
+                Some(at) => format!("{} {}%", css_color(*color), css_number(at * 100.0)),
+                None => css_color(*color),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut layers: Vec<String> = style
+        .background_gradient_layers
+        .iter()
+        .map(|layer| match layer {
+            Layer::Linear {
+                angle,
+                stops: s,
+                repeating,
+                ..
+            } => format!(
+                "{}linear-gradient({}deg, {})",
+                if *repeating { "repeating-" } else { "" },
+                css_number(*angle),
+                stops(s.as_slice()),
+            ),
+            Layer::Radial { stops: s, .. } => format!("radial-gradient({})", stops(s.as_slice())),
+            Layer::Conic {
+                angle, stops: s, ..
+            } => format!(
+                "conic-gradient(from {}deg, {})",
+                css_number(*angle),
+                stops(s.as_slice())
+            ),
+        })
+        .collect();
+    if let Some(image) = &style.background_image {
+        let resolved = base_url
+            .and_then(|base| url::Url::parse(base).ok())
+            .and_then(|base| base.join(image).ok())
+            .map_or_else(|| image.clone(), |joined| joined.to_string());
+        layers.push(format!("url(\"{resolved}\")"));
+    }
+    if layers.is_empty() {
+        "none".to_string()
+    } else {
+        layers.join(", ")
     }
 }
 
@@ -17450,6 +17510,37 @@ mod tests {
         assert_eq!(computed("right")["clear"], "both");
         assert_eq!(computed("plain")["float"], "none");
         assert_eq!(computed("plain")["clear"], "none");
+    }
+
+    #[test]
+    fn computed_style_exposes_background_image() {
+        let tree = parse_html(
+            r#"<style>
+                 #photo{background-image:url(img/bg.png)}
+                 #fade{background:linear-gradient(90deg,#000,#fff)}
+               </style>
+               <div id="photo"></div><div id="fade"></div><div id="plain"></div>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(
+            &tree,
+            (320.0, 200.0),
+            Some("https://assets.test/a/page.html"),
+            &mut resources,
+        )
+        .expect("prepared render");
+        let computed = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .expect("computed style")
+        };
+
+        assert_eq!(
+            computed("photo")["background-image"],
+            r#"url("https://assets.test/a/img/bg.png")"#
+        );
+        assert!(computed("fade")["background-image"].starts_with("linear-gradient("));
+        assert_eq!(computed("plain")["background-image"], "none");
     }
 
     #[test]

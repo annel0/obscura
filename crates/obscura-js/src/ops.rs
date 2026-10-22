@@ -432,10 +432,18 @@ pub struct ObscuraState {
     /// transport client across pages, so the client's aggregate counter cannot
     /// be used as a page-readiness signal.
     pub page_in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// The subset of `page_in_flight` addressed to the page's own site. A
+    /// settle policy waits for these (they are the app's data) but gives up
+    /// on third-party ones (trackers, ads) after a grace period.
+    pub page_in_flight_same_site: Arc<std::sync::atomic::AtomicU32>,
     /// Monotonic generation for observable changes to the connected document.
     /// The browser settle policy samples this to distinguish useful deferred
     /// rendering work from unrelated long-lived timers.
     pub activity_generation: u64,
+    /// The part of `activity_generation` that changes what the document
+    /// says: nodes, text and attributes other than presentation state.
+    /// Animation and transition frames write only style and class.
+    pub content_generation: u64,
     /// Monotonic identity of the currently installed document. Async resource
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
@@ -524,11 +532,25 @@ pub struct ObscuraState {
     pub stylesheet_cache: obscura_render::StylesheetCache,
     #[cfg(feature = "render")]
     pub(crate) style_query_cache: Option<StyleQueryCache>,
+    /// Stylesheets parsed for non-geometric style reads made after the
+    /// sheets changed, so such a read does not lay the document out. Apart
+    /// from `stylesheet_cache`, whose key retained layout is validated
+    /// against.
+    #[cfg(feature = "render")]
+    pub(crate) style_read_stylesheets: obscura_render::StylesheetCache,
+    /// Time this document has spent rebuilding its render tree, held against
+    /// OBSCURA_LAYOUT_BUDGET_MS.
+    #[cfg(feature = "render")]
+    pub(crate) layout_spent: std::time::Duration,
     /// Script-created faces in this document's `FontFaceSet`. This is separate
     /// from the DOM so the bridge does not manufacture a selector-visible
     /// `<style>` element merely to feed the renderer.
     #[cfg(feature = "render")]
     pub dynamic_fonts: Vec<obscura_render::DynamicFontFace>,
+    /// The text of the `blob:` URLs the page minted with
+    /// URL.createObjectURL, for the module loader: import(blobURL) is how
+    /// import-map polyfills load the modules they rewrite.
+    pub blob_sources: HashMap<String, String>,
     /// Live Canvas2D backing stores keyed by stable DOM identity. Pixel damage
     /// updates this resource independently of retained style/layout geometry.
     #[cfg(feature = "render")]
@@ -617,6 +639,7 @@ impl ObscuraState {
         self.blocked_urls = parent.blocked_urls.clone();
         self.intercept_enabled = parent.intercept_enabled;
         self.page_in_flight = parent.page_in_flight.clone();
+        self.page_in_flight_same_site = parent.page_in_flight_same_site.clone();
         #[cfg(feature = "stealth")]
         {
             self.stealth_client = parent.stealth_client.clone();
@@ -678,7 +701,9 @@ impl ObscuraState {
             pending_frame_messages: Vec::new(),
             pending_frame_message_bytes: 0,
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            page_in_flight_same_site: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
+            content_generation: 0,
             document_generation: 0,
             base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
@@ -725,7 +750,12 @@ impl ObscuraState {
             #[cfg(feature = "render")]
             style_query_cache: None,
             #[cfg(feature = "render")]
+            style_read_stylesheets: obscura_render::StylesheetCache::default(),
+            #[cfg(feature = "render")]
+            layout_spent: std::time::Duration::ZERO,
+            #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
+            blob_sources: HashMap::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
@@ -945,6 +975,7 @@ fn fetch_max_body_bytes() -> usize {
 async fn read_body_capped(
     mut response: reqwest::Response,
     max: usize,
+    stall: std::time::Duration,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
     if let Some(len) = response.content_length() {
         if len > max as u64 {
@@ -954,11 +985,17 @@ async fn read_body_capped(
         }
     }
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
-    {
+    loop {
+        let Ok(chunk) = tokio::time::timeout(stall, response.chunk()).await else {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "no body data for {}ms",
+                stall.as_millis()
+            )));
+        };
+        let Some(chunk) = chunk.map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
+        else {
+            break;
+        };
         if buf.len() + chunk.len() > max {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "response body exceeds the maximum of {max} bytes"
@@ -967,6 +1004,42 @@ async fn read_body_capped(
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+/// Whether `url` is on the same site as the page `origin`, comparing hosts by
+/// their registrable domain approximated as the last two labels (three under
+/// a two-letter country code with a generic second level, like `co.uk`).
+/// `read_timeout`, capped by `third_party_timeout` for a request to another
+/// site than the page's.
+fn page_stall_timeout(url: &str, origin: &str) -> std::time::Duration {
+    let stall = obscura_net::read_timeout();
+    match obscura_net::third_party_timeout() {
+        Some(limit) if !same_site_as_page(url, origin) => stall.min(limit),
+        _ => stall,
+    }
+}
+
+fn same_site_as_page(url: &str, origin: &str) -> bool {
+    let host = |value: &str| {
+        url::Url::parse(value).ok().and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+    };
+    let (Some(request), Some(page)) = (host(url), host(origin)) else {
+        return false;
+    };
+    site_key(&request) == site_key(&page)
+}
+
+fn site_key(host: &str) -> String {
+    let host = host.trim_end_matches('.');
+    if host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        return host.to_string();
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let generic_second_level = labels.len() >= 3
+        && labels[labels.len() - 1].len() == 2
+        && matches!(labels[labels.len() - 2], "co" | "com" | "net" | "org" | "gov" | "edu" | "ac");
+    let keep = if generic_second_level { 3 } else { 2 };
+    labels[labels.len().saturating_sub(keep)..].join(".")
 }
 
 struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
@@ -1012,10 +1085,15 @@ pub(crate) struct FetchNetworkGuard {
     pub(crate) state: std::rc::Weak<RefCell<ObscuraState>>,
     pub(crate) event: Option<JsNetworkEvent>,
     pub(crate) cancel: Option<Rc<CancelHandle>>,
+    /// `page_in_flight_same_site`, held for a request to the page's own site.
+    pub(crate) same_site_in_flight: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl Drop for FetchNetworkGuard {
     fn drop(&mut self) {
+        if let Some(counter) = self.same_site_in_flight.take() {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(mut event) = self.event.take() else { return; };
         event.status = 0;
         event.error_text = Some(if self.cancel.as_ref().is_some_and(|cancel| cancel.is_canceled()) {
@@ -1329,6 +1407,23 @@ fn shadow_including_connected_nodes(dom: &DomTree) -> HashSet<NodeId> {
 /// changes the rendered document. Chromium dirties layout when the mutation
 /// reaches a connected style/layout owner, not merely because a mutating API
 /// was entered.
+/// Whether a DOM write can change what the document says rather than how it
+/// looks: style, class, `data-*` and `aria-*` attributes and form state are
+/// what animations, transitions and widgets rewrite frame after frame.
+fn mutation_changes_content(cmd: &str, arg2: &str) -> bool {
+    let attribute = match cmd {
+        "set_form_value" | "set_form_checked" | "set_form_indeterminate" => return false,
+        "set_attribute" | "remove_attribute" => arg2.split('\0').next().unwrap_or(arg2),
+        "set_attribute_ns" => arg2.split('\0').nth(1).unwrap_or(""),
+        "remove_attribute_ns" => arg2.split_once('\0').map_or(arg2, |(_, local)| local),
+        _ => return true,
+    };
+    let attribute = attribute.rsplit(':').next().unwrap_or(attribute).to_ascii_lowercase();
+    !(matches!(attribute.as_str(), "style" | "class")
+        || attribute.starts_with("data-")
+        || attribute.starts_with("aria-"))
+}
+
 fn render_mutation_impact(
     dom: &DomTree,
     cmd: &str,
@@ -2016,6 +2111,20 @@ fn op_stylesheet_generation(state: &OpState, frame_id: u32, linked: bool) -> f64
     generation as f64
 }
 
+/// Keeps a `blob:` URL's text where the module loader can read it. Blob URLs
+/// belong to the page whichever realm minted them.
+#[op2(fast)]
+fn op_blob_register(state: &OpState, #[string] url: &str, #[string] text: &str) {
+    let shared = state.borrow::<SharedState>().clone();
+    shared.borrow_mut().blob_sources.insert(url.to_string(), text.to_string());
+}
+
+#[op2(fast)]
+fn op_blob_revoke(state: &OpState, #[string] url: &str) {
+    let shared = state.borrow::<SharedState>().clone();
+    shared.borrow_mut().blob_sources.remove(url);
+}
+
 #[op2(fast)]
 fn op_cssom_stylesheet_has(state: &OpState, owner_nid: u32, frame_id: u32) -> bool {
     frame_state(state, frame_id).borrow().dom.as_ref()
@@ -2226,6 +2335,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         let invalidate = impact.connected && impact.actual_change;
         if invalidate {
             state.activity_generation = state.activity_generation.wrapping_add(1);
+            if mutation_changes_content(&cmd, &arg2) {
+                state.content_generation = state.content_generation.wrapping_add(1);
+            }
         }
         #[cfg(feature = "render")]
         // Native text values and indeterminate checkbox marks are consumed
@@ -3396,6 +3508,11 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(fetch_timeout())
+        // Fail fast on hosts that never accept the connection, like the page
+        // client does (see obscura_net::connect_timeout). Servers that go
+        // quiet are timed per request in fetch_url_inner, not here: a
+        // connection-level read timeout also kills idle pooled connections.
+        .connect_timeout(obscura_net::connect_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
         .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
             false,
@@ -3406,6 +3523,10 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         // a navigation. Keep connections warm longer.
         .pool_idle_timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(std::time::Duration::from_secs(60));
+    // Same opt-in as the page client (see obscura_net::http2_enabled).
+    if !obscura_net::http2_enabled() {
+        builder = builder.http1_only();
+    }
     if let Some(proxy) = proxy_url {
         let p = reqwest::Proxy::all(proxy)
             .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
@@ -3870,6 +3991,67 @@ enum FetchOptions {
     Cancelable { cancel_rid: u32, destination: String },
 }
 
+/// A fetch()/XHR response kept by the short-lived fetch cache.
+struct CachedFetch {
+    stored: std::time::Instant,
+    status: u16,
+    url: String,
+    redirected: bool,
+    /// Headers the script may read.
+    headers: HashMap<String, String>,
+    response_headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+const FETCH_CACHE_MAX_ENTRIES: usize = 2048;
+
+/// OBSCURA_FETCH_CACHE_TTL_MS: GET fetch()/XHR responses are reused for this
+/// long by every page in the process. A crawler renders many pages of one
+/// site that load the same JSON (menus, sponsors, config); unset, nothing is
+/// cached.
+fn fetch_cache_ttl() -> Option<std::time::Duration> {
+    static TTL: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var("OBSCURA_FETCH_CACHE_TTL_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+    })
+}
+
+fn fetch_cache() -> &'static std::sync::Mutex<HashMap<String, CachedFetch>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, CachedFetch>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn fetch_cache_get(key: &str) -> Option<CachedFetch> {
+    let ttl = fetch_cache_ttl()?;
+    let cache = fetch_cache().lock().ok()?;
+    let entry = cache.get(key).filter(|entry| entry.stored.elapsed() < ttl)?;
+    Some(CachedFetch {
+        stored: entry.stored,
+        status: entry.status,
+        url: entry.url.clone(),
+        redirected: entry.redirected,
+        headers: entry.headers.clone(),
+        response_headers: entry.response_headers.clone(),
+        body: entry.body.clone(),
+    })
+}
+
+fn fetch_cache_insert(key: String, entry: CachedFetch) {
+    let Some(ttl) = fetch_cache_ttl() else { return };
+    let Ok(mut cache) = fetch_cache().lock() else { return };
+    if cache.len() >= FETCH_CACHE_MAX_ENTRIES {
+        cache.retain(|_, cached| cached.stored.elapsed() < ttl);
+        if cache.len() >= FETCH_CACHE_MAX_ENTRIES {
+            return;
+        }
+    }
+    cache.insert(key, entry);
+}
+
 async fn fetch_url_inner(
     state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String,
     body: JsBuffer, origin: String, mode: String, credentials: String,
@@ -3973,6 +4155,21 @@ async fn fetch_url_inner(
     }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
+    // fetch()/XHR to the page's own site is its data; a settle policy waits
+    // for it and not for third-party requests (see page_in_flight_same_site).
+    // Scripts, even same-site ones, are not data: habr.com's own analytics
+    // script intermittently never answers.
+    let is_data = matches!(resource_type, ResourceType::Fetch | ResourceType::Xhr);
+    let same_site_in_flight = (is_data && same_site_as_page(&url, &origin)).then(|| {
+        let counter = state
+            .borrow()
+            .borrow::<SharedState>()
+            .borrow()
+            .page_in_flight_same_site
+            .clone();
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        counter
+    });
     let mut network_guard = FetchNetworkGuard {
         state: Rc::downgrade(state.borrow().borrow::<SharedState>()),
         event: Some(JsNetworkEvent {
@@ -3981,8 +4178,41 @@ async fn fetch_url_inner(
             resource_type: resource_type_name.to_string(),
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
         }),
+        same_site_in_flight,
         cancel: cancel.clone(),
     };
+    // A plain GET for data, not intercepted and without credentials of its
+    // own, may come from the short-lived fetch cache.
+    let fetch_cache_key = (fetch_cache_ttl().is_some()
+        && intercept_tx.is_none()
+        && method.eq_ignore_ascii_case("GET")
+        && body.is_empty()
+        && !internal_load
+        && !headers_json.to_ascii_lowercase().contains("authorization"))
+    .then(|| format!("{url}\n{origin}\n{mode}\n{credentials}\n{headers_json}"));
+    if let Some(hit) = fetch_cache_key.as_deref().and_then(fetch_cache_get) {
+        network_guard.event = None;
+        record_js_network_completion(&state, JsNetworkEvent {
+            request_id: request_id.clone(), intercepted: false,
+            error_text: None,
+            url: hit.url.clone(), method: method.clone(), status: hit.status,
+            resource_type: resource_type_name.to_string(),
+            response_headers: hit.response_headers.clone(), body_size: hit.body.len(),
+            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs_f64(),
+        }, &String::from_utf8_lossy(&hit.body), false);
+        let metadata = serde_json::json!({
+            "status": hit.status,
+            "requestId": request_id,
+            "url": hit.url,
+            "redirected": hit.redirected,
+            "opaque": false,
+            "headers": hit.headers,
+        });
+        let bytes = hit.body;
+        let body = Box::pin(async move { Ok(bytes) });
+        return fetch_body_result(&state, metadata, body, internal_load, cancel).await;
+    }
     let credentials = FetchCredentials::parse(&credentials);
 
     // Slots the interception channel can override via Continue so a consumer
@@ -4348,7 +4578,24 @@ async fn fetch_url_inner(
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 PageInFlightGuard(counter.clone())
             });
-            req.send().await.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
+            // A dynamic script or stylesheet whose server never answers
+            // delays the load event; give up after the stall timeout like the
+            // page client does. fetch()/XHR keep the whole-request timeout.
+            let sent = if matches!(resource_type, ResourceType::Script | ResourceType::Stylesheet) {
+                let stall = page_stall_timeout(&url, &origin);
+                match tokio::time::timeout(stall, req.send()).await {
+                    Ok(sent) => sent,
+                    Err(_) => {
+                        return Err(deno_error::JsErrorBox::generic(format!(
+                            "{current_url}: no response within {}ms",
+                            stall.as_millis()
+                        )));
+                    }
+                }
+            } else {
+                req.send().await
+            };
+            sent.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
         };
 
         if credentials_allowed {
@@ -4506,6 +4753,27 @@ async fn fetch_url_inner(
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
 
+    let fetch_cache_entry = fetch_cache_key
+        .filter(|_| {
+            status == 200
+                && !opaque
+                && !was_intercepted
+                && !resp_headers.contains_key("set-cookie")
+                && !resp_headers
+                    .get("cache-control")
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("no-store"))
+        })
+        .map(|key| {
+            (key, CachedFetch {
+                stored: std::time::Instant::now(),
+                status,
+                url: current_url.to_string(),
+                redirected,
+                headers: script_headers.clone(),
+                response_headers: resp_headers.clone(),
+                body: Vec::new(),
+            })
+        });
     let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
         "requestId": request_id,
@@ -4519,7 +4787,12 @@ async fn fetch_url_inner(
     let body = Box::pin(async move {
         let _page_in_flight = _page_in_flight;
         let mut network_guard = network_guard;
-        let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        let resp_bytes =
+            read_body_capped(response, fetch_max_body_bytes(), page_stall_timeout(&url, &origin)).await?;
+        if let Some((key, mut entry)) = fetch_cache_entry {
+            entry.body = resp_bytes.to_vec();
+            fetch_cache_insert(key, entry);
+        }
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -5544,7 +5817,7 @@ mod tests {
             .send()
             .await
             .expect("request should reach the local server");
-        let err = read_body_capped(resp, 1024 * 1024)
+        let err = read_body_capped(resp, 1024 * 1024, obscura_net::read_timeout())
             .await
             .expect_err("a body larger than the cap must be rejected");
         assert!(
@@ -5561,7 +5834,7 @@ mod tests {
             .send()
             .await
             .expect("request should reach the local server");
-        let body = read_body_capped(resp, 1024 * 1024)
+        let body = read_body_capped(resp, 1024 * 1024, obscura_net::read_timeout())
             .await
             .expect("a small body must be read successfully");
         assert_eq!(body.len(), 1024, "should read the whole small body");
@@ -7733,6 +8006,8 @@ pub fn build_extension() -> Extension {
         op_external_stylesheet_get(),
         op_stylesheet_generation(),
         op_cssom_stylesheet_has(),
+        op_blob_register(),
+        op_blob_revoke(),
         op_cssom_stylesheet_update(),
         op_cssom_stylesheet_clear(),
         op_runtime_events_enabled(),
@@ -8076,6 +8351,33 @@ pub(crate) fn ensure_prepared_render(
     ensure_prepared_render_with_base_url(state, base_url)
 }
 
+/// OBSCURA_LAYOUT_BUDGET_MS: once a document has spent this long rebuilding
+/// its render tree, layout reads are answered from the last tree instead of
+/// a fresh one. A page that interleaves DOM writes with geometry reads (an
+/// animation library setting up hundreds of elements) lays out again for
+/// each, a quarter second apiece on a big page: webflow.com spent 23 s of a
+/// render that way. Unset: no limit.
+#[cfg(all(test, feature = "render"))]
+thread_local! {
+    /// Lets a test set the layout budget for its own thread.
+    pub(crate) static LAYOUT_BUDGET_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "render")]
+fn layout_budget() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if let Some(budget) = LAYOUT_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        return Some(budget);
+    }
+    static BUDGET: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("OBSCURA_LAYOUT_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+    })
+}
+
 #[cfg(feature = "render")]
 fn ensure_prepared_render_with_base_url(
     state: &mut ObscuraState,
@@ -8090,7 +8392,18 @@ fn ensure_prepared_render_with_base_url(
     let needs_rebuild = state.prepared_render.as_ref().map_or(true, |prepared| {
         incompatible || prepared.animation_sample() != animation_sample
     }) || !state.pending_style_mutations.is_empty();
+    // Over budget, a tree that still fits the viewport and base answers for
+    // the document; what changed since stays queued.
+    if needs_rebuild
+        && !incompatible
+        && state.prepared_render.is_some()
+        && layout_budget().is_some_and(|budget| state.layout_spent >= budget)
+    {
+        return state.prepared_render.as_ref();
+    }
     if needs_rebuild {
+        let rebuild_started = std::time::Instant::now();
+        let retained = state.prepared_render.is_some() && !incompatible;
         if let Some(dom) = state.dom.as_ref() {
             state.animation_timeline.materialize_start_candidates(dom);
         }
@@ -8161,6 +8474,13 @@ fn ensure_prepared_render_with_base_url(
         }
         state.prepared_render = Some(prepared);
         state.resolved_scroll = None;
+        state.layout_spent += rebuild_started.elapsed();
+        tracing::debug!(
+            target: "obscura_js::layout",
+            ms = rebuild_started.elapsed().as_micros() as f64 / 1000.0,
+            retained,
+            "render tree rebuilt"
+        );
     }
     state.prepared_render.as_ref()
 }
@@ -8985,6 +9305,24 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
 
     let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
+    if intersection_full_viewport() {
+        // Every target (and root) fills the viewport: observers report each
+        // target intersecting once, and no layout is computed for it.
+        let (width, height) = gs.viewport;
+        let full = serde_json::json!({
+            "x": 0.0,
+            "y": 0.0,
+            "width": width,
+            "height": height,
+            "clientWidth": width,
+            "clientHeight": height,
+            "borderTopWidth": "0px",
+            "borderLeftWidth": "0px",
+            "overflowX": "visible",
+            "overflowY": "visible",
+        });
+        return serde_json::to_string(&vec![full; nids.len()]).unwrap_or_else(|_| "[]".to_string());
+    }
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
         return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
@@ -9027,6 +9365,30 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
     serde_json::to_string(&measurements).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// OBSCURA_INTERSECTION_FULL_VIEWPORT=1: IntersectionObserver treats every
+/// target as filling the viewport instead of measuring it. Measuring needs a
+/// fresh layout after every DOM change, which was most of the layouts a
+/// documentation site's render paid for. A crawler wants what a very tall
+/// viewport shows (lazy content loaded), which this gives without layout.
+#[cfg(test)]
+thread_local! {
+    /// Lets a test turn the full-viewport mode on for its own thread.
+    pub(crate) static INTERSECTION_FULL_VIEWPORT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "render")]
+fn intersection_full_viewport() -> bool {
+    #[cfg(test)]
+    if INTERSECTION_FULL_VIEWPORT_FOR_TEST.with(std::cell::Cell::get) {
+        return true;
+    }
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| {
+        std::env::var("OBSCURA_INTERSECTION_FULL_VIEWPORT")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+    })
+}
+
 /// CSSOM snapshot and completeness flag. Non-geometric reads can resolve only
 /// the ancestor cascade while leaving layout damage pending for geometry/paint.
 #[cfg(feature = "render")]
@@ -9054,6 +9416,11 @@ fn op_computed_style(
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
+    if pseudo.is_empty() && obscura_render::dom::NonGeometricStyleCache::never_computed(&property) {
+        // Partial and empty: the bridge falls back for this property alone
+        // and asks again for any other.
+        return serde_json::json!([false, {}]).to_string();
+    }
     let base_url = document_base_url_for_javascript_task(&gs);
     let needs_style_resolution = gs.prepared_render.as_ref().is_none_or(|prepared| {
         prepared.viewport() != gs.viewport || prepared.base_url() != base_url.as_deref()
@@ -9071,10 +9438,16 @@ fn op_computed_style(
                 && cache.stylesheet_generation == stylesheet_generation
                 && cache.viewport == gs.viewport && cache.media == gs.render_media
         }) {
-            cached = gs.dom.as_ref().and_then(|dom| {
+            let state = &mut *gs;
+            cached = state.dom.as_ref().map(|dom| {
                 obscura_render::dom::NonGeometricStyleCache::new(
-                    dom, gs.viewport, gs.render_media, &gs.stylesheet_cache,
+                    dom, state.viewport, state.render_media, &state.stylesheet_cache,
                 )
+                // The sheets changed since the last prepare: parse them for
+                // the read instead of laying the whole document out.
+                .unwrap_or_else(|| obscura_render::dom::NonGeometricStyleCache::new_parsing(
+                    dom, state.viewport, state.render_media, &mut state.style_read_stylesheets,
+                ))
             }).map(|cascade| StyleQueryCache {
                 task_generation: gs.animation_task_generation,
                 activity_generation: gs.activity_generation,

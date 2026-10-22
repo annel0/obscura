@@ -1275,7 +1275,15 @@ impl ObscuraJsRuntime {
         gs.dom = Some(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
+        gs.content_generation = 0;
+        // A document's blob: URLs go with it.
+        gs.blob_sources.clear();
+        #[cfg(feature = "render")]
+        {
+            gs.layout_spent = std::time::Duration::ZERO;
+        }
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        gs.page_in_flight_same_site = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
         // A new document owns a fresh retained scene and resource cache.
         #[cfg(feature = "render")]
@@ -1304,6 +1312,7 @@ impl ObscuraJsRuntime {
             gs.render_resource_tx = tx;
             gs.render_resource_rx = rx;
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
+            gs.style_read_stylesheets = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
             gs.scroll_offset = (0.0, 0.0);
@@ -2318,6 +2327,17 @@ impl ObscuraJsRuntime {
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
                 let load = async move {
+                    // A crawler skips what only pixels need: the load fails
+                    // at once, as an unreachable URL does, and is not retried.
+                    if skip_render_resource(is_font) {
+                        return crate::ops::RenderResourceLoad {
+                            generation,
+                            url: raw,
+                            profile,
+                            is_font,
+                            response: None,
+                        };
+                    }
                     // Every load of this page waits for the same permits, so
                     // repeated scans cannot multiply the request rate.
                     let _permit = limiter.acquire_owned().await.ok();
@@ -3555,12 +3575,47 @@ impl ObscuraJsRuntime {
         self.state.borrow().activity_generation
     }
 
-    fn has_pending_network_requests(&self) -> bool {
+    /// Generation of the connected-document mutations that change content:
+    /// `activity_generation` without style, class, `data-*`, `aria-*` and
+    /// form-state writes.
+    pub fn content_generation(&self) -> u64 {
+        self.state.borrow().content_generation
+    }
+
+    /// Whether a fetch()/XHR or dynamic script request the page started is
+    /// still in flight.
+    pub fn has_pending_network_requests(&self) -> bool {
         let state = self.state.borrow();
         state
             .page_in_flight
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
+    }
+
+    /// Whether an `import()` is loading, or finished a moment ago and its
+    /// module graph may still be on its way to the next dependency.
+    pub fn has_pending_dynamic_imports(&self) -> bool {
+        self.module_load_activity
+            .is_pending_or_recent(std::time::Duration::from_millis(100))
+    }
+
+    /// Whether a request the page started to its own site is still in flight.
+    pub fn has_pending_same_site_requests(&self) -> bool {
+        self.state
+            .borrow()
+            .page_in_flight_same_site
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
+
+    /// Whether a setTimeout/setInterval callback is still due.
+    pub fn has_pending_timers(&mut self) -> bool {
+        self.next_pending_timeout_delay_ms().is_some()
+    }
+
+    /// Whether any script of the current document has started.
+    pub fn has_started_scripts(&self) -> bool {
+        !self.state.borrow().already_started_scripts.borrow().is_empty()
     }
 
     fn next_pending_timeout_delay_ms(&mut self) -> Option<f64> {
@@ -4086,6 +4141,7 @@ impl ObscuraJsRuntime {
             state.render_resource_tx = tx;
             state.render_resource_rx = rx;
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
+            state.style_read_stylesheets = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
             state.element_scroll_offsets.clear();
             state.resolved_scroll = None;
@@ -4585,6 +4641,18 @@ impl Default for ObscuraJsRuntime {
     fn default() -> Self {
         Self::new()
     }
+}
+
+
+/// OBSCURA_RENDER_SKIP_IMAGES=1 / OBSCURA_RENDER_SKIP_FONTS=1: layout does
+/// not download images or web fonts. A crawler reading the DOM needs
+/// neither, and they were the connections most renders opened.
+#[cfg(feature = "render")]
+fn skip_render_resource(is_font: bool) -> bool {
+    static SKIP: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let flag = |key: &str| std::env::var(key).is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"));
+    let (images, fonts) = *SKIP.get_or_init(|| (flag("OBSCURA_RENDER_SKIP_IMAGES"), flag("OBSCURA_RENDER_SKIP_FONTS")));
+    if is_font { fonts } else { images }
 }
 
 #[cfg(test)]
@@ -5902,6 +5970,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn workers_import_blob_and_data_scripts() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("https://example.test/worker-imports.js", r#"
+            const helper = URL.createObjectURL(new Blob(['self.fromBlob = 2;'], { type: 'text/javascript' }));
+            const source = `
+                importScripts(${JSON.stringify(helper)}, 'data:text/javascript,self.fromData%20%3D%203%3B');
+                let missing = 'none';
+                try { importScripts('https://example.test/never-fetched.js'); } catch (error) { missing = error.name; }
+                onmessage = () => postMessage([fromBlob, fromData, missing]);
+            `;
+            const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+            worker.onmessage = event => { globalThis.__imports = event.data; };
+            worker.postMessage('go');
+        "#).unwrap();
+        rt.run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(rt.evaluate("globalThis.__imports").unwrap(), serde_json::json!([2, 3, "NetworkError"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_onmessage_bindings_do_not_mutate_window() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script("worker-onmessage-bindings", r#"
@@ -6438,6 +6525,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn import_from_code_without_a_url_resolves_against_the_document() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "undefined",
+            r#"
+                const url = URL.createObjectURL(new Blob(["export default 'lazy';"], { type: "text/javascript" }));
+                import(url).then(module => { globalThis.__lazy = module.default; }, error => { globalThis.__lazy = String(error); });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(1_000).await.unwrap();
+        assert_eq!(rt.evaluate("globalThis.__lazy").unwrap(), serde_json::json!("lazy"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_of_a_blob_url_runs_its_module() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "https://example.test/blob-import.js",
+            r#"
+                const url = URL.createObjectURL(new Blob(["export const answer = 42;"], { type: "text/javascript" }));
+                const revoked = URL.createObjectURL(new Blob(["export const answer = 1;"]));
+                URL.revokeObjectURL(revoked);
+                Promise.all([
+                    import(url).then(module => module.answer),
+                    import(revoked).then(() => "loaded", () => "failed"),
+                ]).then(results => { globalThis.__blob = results; }, error => { globalThis.__blob = String(error); });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(1_000).await.unwrap();
+        assert_eq!(rt.evaluate("globalThis.__blob").unwrap(), serde_json::json!([42, "failed"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn permission_status_is_an_event_target() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "permission-status",
+            r#"
+                navigator.permissions.query({ name: "geolocation" }).then(status => {
+                    let heard = 0;
+                    const listener = () => { heard++; };
+                    status.addEventListener("change", listener);
+                    status.dispatchEvent(new Event("change"));
+                    status.removeEventListener("change", listener);
+                    status.dispatchEvent(new Event("change"));
+                    globalThis.__permission = [
+                        String(status), status.state, status.name, status instanceof EventTarget,
+                        status instanceof PermissionStatus, heard,
+                    ];
+                });
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(1_000).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__permission").unwrap(),
+            serde_json::json!(["[object PermissionStatus]", "prompt", "geolocation", true, true, 1]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn broadcast_channel_delivers_independent_post_time_clones_to_matching_peers() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -6603,6 +6753,147 @@ mod tests {
     }
 
     #[test]
+    fn token_lists_take_strings_and_character_data_has_element_siblings() {
+        let mut rt = setup_runtime("<html><body><iframe id=f></iframe><a id=a href=x>x</a><!--marker--><div id=d></div></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            'use strict';
+            const $ = id => document.getElementById(id);
+            $('f').sandbox = 'allow-scripts';
+            $('d').classList = 'x y';
+            $('a').relList = 'noopener';
+            $('d').relList = 'kept';
+            const marker = $('a').nextSibling;
+            return [$('f').getAttribute('sandbox'), $('d').className, $('a').getAttribute('rel'),
+                $('d').relList, $('d').hasAttribute('rel'), marker.nodeType,
+                marker.nextElementSibling.id, marker.previousElementSibling.id];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["allow-scripts", "x y", "noopener", "kept", false, 8, "d", "a"]));
+    }
+
+    #[test]
+    fn canvas_2d_methods_live_on_the_interface_prototype() {
+        let mut rt = setup_runtime("<html><body><canvas id=c width=10 height=10></canvas></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            let calls = 0;
+            const proto = CanvasRenderingContext2D.prototype;
+            proto.arc = new Proxy(proto.arc, { apply(target, self, args) { calls++; return Reflect.apply(target, self, args); } });
+            const ctx = document.getElementById('c').getContext('2d');
+            ctx.beginPath();
+            ctx.arc(5, 5, 2, 0, Math.PI * 2);
+            return [ctx instanceof CanvasRenderingContext2D, Object.prototype.toString.call(ctx),
+                CanvasRenderingContext2D.name, typeof proto.fillText, calls];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, "[object CanvasRenderingContext2D]", "CanvasRenderingContext2D", "function", 1]));
+    }
+
+    #[test]
+    fn every_html_element_interface_exists_and_brands_its_tags() {
+        let mut rt = setup_runtime(r#"<html><head><base href="/"><title>t</title></head><body>
+            <table><tbody><tr><td id=c>1</td></tr></tbody></table><time id=t>now</time><div id=d></div></body></html>"#);
+        let result = rt.evaluate(r#"(function() {
+            const $ = id => document.getElementById(id);
+            return [typeof HTMLBaseElement, typeof HTMLTableCellElement, typeof HTMLDocument,
+                document.querySelector('base') instanceof HTMLBaseElement,
+                $('c') instanceof HTMLTableCellElement, $('c') instanceof Element,
+                $('t') instanceof HTMLTimeElement, $('d') instanceof HTMLTimeElement,
+                document.createElement('tr') instanceof HTMLTableRowElement,
+                document instanceof HTMLDocument, typeof DOMMatrixReadOnly, typeof DOMPointReadOnly];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "function", "function", "function", true, true, true, true, false, true, true, "function", "function"]));
+    }
+
+    #[test]
+    fn dom_implementation_is_one_global_interface_per_document() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const implementation = document.implementation;
+            const detached = implementation.createHTMLDocument('t');
+            const doctype = implementation.createDocumentType('html', '', '');
+            return [typeof DOMImplementation, implementation instanceof DOMImplementation,
+                implementation === document.implementation,
+                typeof DOMImplementation.prototype.createHTMLDocument,
+                detached.title, detached.implementation !== implementation,
+                doctype.ownerDocument === document, (() => { try { new DOMImplementation(); return 'made'; } catch (e) { return e.name; } })()];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["function", true, true, "function", "t", true, true, "TypeError"]));
+    }
+
+    #[test]
+    fn only_value_bearing_elements_have_a_value() {
+        let mut rt = setup_runtime(r#"<html><body><div id=d></div>
+            <select id=s><option value=a>A</option><option value=b selected>B</option></select>
+            <button id=b value=go>Go</button><ol><li id=l value=7>x</li></ol>
+            <textarea id=t>text</textarea><input id=i value=v></body></html>"#);
+        let result = rt.evaluate(r#"(function() {
+            const $ = id => document.getElementById(id);
+            const has = el => 'value' in el;
+            return [has($('d')), has(document.createElement('span')), has(document.createElement('a')),
+                $('s').value, $('b').value, $('l').value, $('t').value, $('i').value,
+                document.createElement('option') instanceof HTMLOptionElement,
+                $('d') instanceof HTMLButtonElement, $('b') instanceof HTMLButtonElement,
+                new Option('x', 'y').value];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            false, false, false, "b", "go", 7, "text", "v", true, false, true, "y"]));
+    }
+
+    #[test]
+    fn event_handler_properties_survive_a_frozen_element_prototype() {
+        let mut rt = setup_runtime("<html><body><button id=b>go</button></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            'use strict';
+            Object.freeze(Element.prototype);
+            const script = document.createElement('script');
+            script.onerror = () => {};
+            const button = document.getElementById('b');
+            let clicked = 0;
+            button.onclick = () => { clicked++; };
+            button.click();
+            button.onclick = 'not a function';
+            button.click();
+            return [typeof script.onerror, clicked, button.onclick, 'onclick' in button,
+                Object.keys(button).includes('onclick'), document.createElement('div').onload];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["function", 1, null, true, false, null]));
+    }
+
+    #[test]
+    fn script_elements_report_the_script_types_they_support() {
+        let mut rt = setup_runtime("<html><head><script id=s>1</script></head><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const parsed = document.getElementById('s');
+            const created = document.createElement('script');
+            return [HTMLScriptElement.supports.name, HTMLScriptElement.supports('importmap'),
+                HTMLScriptElement.supports('module'), HTMLScriptElement.supports('classic'),
+                HTMLScriptElement.supports('speculationrules'),
+                parsed instanceof HTMLScriptElement, created instanceof HTMLScriptElement,
+                document.body instanceof HTMLScriptElement, created instanceof Element,
+                typeof Element.supports,
+                (created.src = 'x.js', [created.getAttribute('src'), created.src.endsWith('/x.js')])];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "supports", true, true, true, false, true, true, false, true, "undefined", ["x.js", true]]));
+    }
+
+    #[test]
+    fn navigation_timing_entry_is_listed_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const [entry] = performance.getEntriesByType('navigation');
+            const json = entry.toJSON();
+            return [entry.entryType, entry.name === location.href, entry.startTime, entry.type,
+                entry instanceof PerformanceNavigationTiming, entry instanceof PerformanceEntry,
+                performance.getEntries()[0] === entry,
+                performance.getEntriesByName(location.href, 'navigation').length,
+                typeof entry.domContentLoadedEventStart, entry.domContentLoadedEventStart >= 0,
+                typeof json.responseStart, 'detail' in json];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "navigation", true, 0, "navigate", true, true, true, 1, "number", true, "number", false]));
+    }
+
+    #[test]
     fn user_timing_clear_methods_preserve_other_entry_types() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.evaluate(r#"(function() {
@@ -6610,9 +6901,10 @@ mod tests {
             performance.mark('other', {startTime: 2});
             performance.measure('same', {start: 1, end: 3});
             performance.clearMarks('same');
-            const before = performance.getEntries().map(e => e.entryType + ':' + e.name);
+            const timing = () => performance.getEntries().filter(e => e.entryType !== 'navigation');
+            const before = timing().map(e => e.entryType + ':' + e.name);
             performance.clearMeasures();
-            return [before, performance.getEntries().map(e => e.name)];
+            return [before, timing().map(e => e.name)];
         })()"#).unwrap();
         assert_eq!(result, serde_json::json!([["measure:same", "mark:other"], ["other"]]));
     }
@@ -6637,7 +6929,7 @@ mod tests {
                 () => performance.getEntriesByName(),
                 () => new PerformanceEntry(), () => new PerformanceMeasure(),
             ].map(fn => { try { fn(); return 'none'; } catch (error) { return error.name; } });
-            return [errors, performance.getEntries().length];
+            return [errors, performance.getEntries().filter(e => e.entryType !== 'navigation').length];
         })()"#).unwrap();
         assert_eq!(result, serde_json::json!([[
             "TypeError", "TypeError", "SyntaxError", "TypeError", "TypeError", "DataCloneError",
@@ -8660,6 +8952,60 @@ mod tests {
     }
 
     #[test]
+    fn form_fields_expose_their_default_value() {
+        let mut rt = setup_runtime(
+            "<html><body><input id=i value='a\nb'><input id=c type=checkbox checked><textarea id=t>x\r\ny</textarea></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const input = document.getElementById("i");
+                const box = document.getElementById("c");
+                const area = document.getElementById("t");
+                // What Vue's v-model created() hook does with them.
+                const cleaned = input.defaultValue.replace(/[\r\n]/g, "");
+                input.value = "typed";
+                const kept = input.defaultValue;
+                input.defaultValue = "z";
+                box.defaultChecked = false;
+                return [
+                    cleaned,
+                    kept,
+                    input.getAttribute("value"),
+                    area.defaultValue,
+                    box.hasAttribute("checked"),
+                    document.createElement("div").defaultValue === undefined,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["ab", "a\nb", "z", "x\ny", false, true]));
+    }
+
+    #[test]
+    fn svg_animated_string_is_a_global_interface() {
+        let mut rt = setup_runtime("<html><body><svg class='icon'><a href='#x'></a></svg></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const svg = document.querySelector("svg");
+                let constructed = "constructed";
+                try { new SVGAnimatedString(); } catch (e) { constructed = e.constructor.name; }
+                return [
+                    typeof SVGAnimatedString,
+                    svg.className instanceof SVGAnimatedString,
+                    svg.querySelector("a").href instanceof SVGAnimatedString,
+                    svg.className.baseVal,
+                    constructed,
+                    document.createElement("div").className instanceof SVGAnimatedString,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["function", true, true, "icon", "TypeError", false]));
+    }
+
+    #[test]
     fn html_lookalike_tags_keep_their_html_interfaces() {
         // A `<text>` or `<image>` in the HTML namespace is not an SVG element,
         // so the new SVG table must not claim it.
@@ -9929,6 +10275,92 @@ mod tests {
         })()"#).unwrap(), serde_json::json!([
             "rgb(255, 0, 0)", "rgb(0, 0, 255)", "inline", "rgb(0, 128, 0)"
         ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn layout_reads_over_budget_get_the_last_tree() {
+        let read = r#"(() => {
+            const box = document.getElementById('box');
+            const before = box.getBoundingClientRect().width;
+            box.style.width = '160px';
+            return [before, box.getBoundingClientRect().width];
+        })()"#;
+        let html = r#"<!doctype html><body style="margin:0"><div id=box style="width:80px;height:10px"></div></body>"#;
+        let mut rt = setup_runtime(html);
+        rt.set_viewport(400.0, 200.0);
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!([80, 160]));
+
+        crate::ops::LAYOUT_BUDGET_FOR_TEST.with(|budget| budget.set(Some(std::time::Duration::ZERO)));
+        let mut rt = setup_runtime(html);
+        rt.set_viewport(400.0, 200.0);
+        let result = rt.evaluate(read).unwrap();
+        crate::ops::LAYOUT_BUDGET_FOR_TEST.with(|budget| budget.set(None));
+        assert_eq!(result, serde_json::json!([80, 80]), "a spent budget answers from the last tree");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn transition_timing_reads_skip_layout_and_keep_their_answers() {
+        // No CSS animation: listing a target's animations needs its styles.
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            #box { width:80px; transition:opacity .3s ease .1s }
+        </style><body><div id=box style="transition-duration:.5s">text</div></body>"#);
+        rt.set_viewport(400.0, 200.0);
+        let read = r#"(() => {
+            const style = getComputedStyle(document.getElementById('box'));
+            return [style.transitionDuration, style.transitionDelay, style.animationDuration, style.display];
+        })()"#;
+        let prepares = rt.state.borrow().stylesheet_cache.miss_count();
+        let before = rt.evaluate(read).unwrap();
+        // `display` may prepare the document once; the timing reads never do.
+        assert!(rt.state.borrow().stylesheet_cache.miss_count() <= prepares + 1);
+        rt.evaluate("document.getElementById('box').setAttribute('data-x', '1')").unwrap();
+        let prepares = rt.state.borrow().stylesheet_cache.miss_count()
+            + rt.state.borrow().stylesheet_cache.hit_count();
+        rt.evaluate(r#"(() => {
+            const style = getComputedStyle(document.getElementById('box'));
+            return [style.transitionDuration, style.transitionDelay, style.animationDelay];
+        })()"#).unwrap();
+        assert_eq!(rt.state.borrow().stylesheet_cache.miss_count() + rt.state.borrow().stylesheet_cache.hit_count(),
+            prepares, "timing reads prepared the document");
+        // The complete snapshot has none of these, so a layout changes no answer.
+        rt.evaluate("document.getElementById('box').getBoundingClientRect().width").unwrap();
+        let id = rt.with_dom(|dom| dom.get_element_by_id("box").unwrap()).unwrap();
+        let keys: Vec<&str> = rt.state.borrow().prepared_render.as_ref().unwrap()
+            .computed_style(id).unwrap().into_keys().collect();
+        assert!(keys.len() > 20);
+        assert!(keys.iter().all(|key| !obscura_render::dom::NonGeometricStyleCache::never_computed(key)),
+            "the snapshot now computes {keys:?}");
+        assert_eq!(rt.evaluate(read).unwrap(), before);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_geometric_read_after_a_sheet_change_parses_without_layout() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            #box { width:80px; height:20px; opacity:.5 }
+        </style><body><div id=box>text</div></body>"#);
+        rt.set_viewport(400.0, 200.0);
+        assert_eq!(rt.evaluate("document.getElementById('box').getBoundingClientRect().width").unwrap(),
+            serde_json::json!(80.0));
+        assert_eq!(rt.state.borrow().stylesheet_cache.miss_count(), 1);
+        // A route change adds its chunk's sheet, then a transition reads the
+        // opacity it starts from.
+        assert_eq!(rt.evaluate(r#"(() => {
+            const sheet = document.createElement('style');
+            sheet.textContent = '#box { opacity:.25; width:160px }';
+            document.head.appendChild(sheet);
+            return getComputedStyle(document.getElementById('box')).opacity;
+        })()"#).unwrap(), serde_json::json!("0.25"));
+        {
+            let state = rt.state.borrow();
+            assert_eq!(state.stylesheet_cache.miss_count(), 1, "the read laid the document out");
+            assert_eq!(state.style_read_stylesheets.miss_count(), 1);
+        }
+        assert_eq!(rt.evaluate("document.getElementById('box').getBoundingClientRect().width").unwrap(),
+            serde_json::json!(160.0));
+        assert_eq!(rt.state.borrow().stylesheet_cache.miss_count(), 2);
     }
 
     #[cfg(feature = "render")]
@@ -15282,6 +15714,44 @@ mod tests {
                 .unwrap(),
             serde_json::json!([2, 2])
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_full_viewport_mode_reports_every_target_visible() {
+        crate::ops::INTERSECTION_FULL_VIEWPORT_FOR_TEST.with(|flag| flag.set(true));
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="height:5000px"></div>
+                <div id="far" style="height:100px"></div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const records = [];
+                    const observer = new IntersectionObserver(entries => {
+                        for (const entry of entries) {
+                            records.push([entry.isIntersecting, entry.intersectionRatio]);
+                        }
+                    });
+                    observer.observe(document.getElementById("far"));
+                    setTimeout(() => resolve(records), 50);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        crate::ops::INTERSECTION_FULL_VIEWPORT_FOR_TEST.with(|flag| flag.set(false));
+        assert_eq!(result.value.unwrap(), serde_json::json!([[true, 1]]));
     }
 
     #[cfg(feature = "render")]

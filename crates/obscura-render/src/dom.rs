@@ -3342,13 +3342,45 @@ fn container_iteration_termination<T: PartialEq>(
 
 enum RetainedStylePlan {
     Reuse {
-        dirty: HashSet<NodeId>,
+        dirty: DirtyNodes,
         has_animation_damage: bool,
     },
     Full,
 }
 
-fn add_style_subtree(tree: &DomTree, root: NodeId, dirty: &mut HashSet<NodeId>) {
+/// Nodes whose retained styles a mutation batch invalidates, and the roots
+/// of the subtrees added whole. A `:has()` anchor high in the tree marks its
+/// whole subtree for every mutation under it; on a page that mutates a few
+/// hundred nodes at once, re-adding the same document each time took most
+/// of the render.
+#[derive(Default)]
+struct DirtyNodes {
+    nodes: HashSet<NodeId>,
+    subtrees: HashSet<NodeId>,
+}
+
+impl std::ops::Deref for DirtyNodes {
+    type Target = HashSet<NodeId>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.nodes
+    }
+}
+
+impl std::ops::DerefMut for DirtyNodes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.nodes
+    }
+}
+
+fn add_style_subtree(tree: &DomTree, root: NodeId, dirty: &mut DirtyNodes) {
+    // Inside a subtree added whole, the root, its descendants and its
+    // ancestors up to that subtree's root are all there already.
+    let ancestors = tree.ancestors(root);
+    if dirty.subtrees.contains(&root) || ancestors.iter().any(|ancestor| dirty.subtrees.contains(ancestor)) {
+        return;
+    }
+    dirty.subtrees.insert(root);
     dirty.insert(root);
     dirty.extend(tree.descendants(root));
     // Rebuild the context chain too. A retained ancestor may carry a final
@@ -3356,7 +3388,7 @@ fn add_style_subtree(tree: &DomTree, root: NodeId, dirty: &mut HashSet<NodeId>) 
     // fixups) where a full pass would feed its specified Auto/inherit form to
     // the fresh descendant's normalization. Ancestors are fresh individually;
     // their unrelated sibling subtrees remain reusable.
-    dirty.extend(tree.ancestors(root));
+    dirty.extend(ancestors);
 }
 
 fn add_container_query_reset_scopes(
@@ -3367,7 +3399,7 @@ fn add_container_query_reset_scopes(
     active_containers: &HashSet<NodeId>,
     inside_active_container: bool,
     selected_ancestor: bool,
-    dirty: &mut HashSet<NodeId>,
+    dirty: &mut DirtyNodes,
 ) {
     let is_element = tree.with_node(id, |node| node.is_element()).unwrap_or(false);
     let can_query_here = inside_active_container || active_containers.contains(&id);
@@ -3436,7 +3468,7 @@ fn has_container_query_subject(tree: &DomTree, sheet: &crate::css::Stylesheet) -
     false
 }
 
-fn add_following_sibling_subtrees(tree: &DomTree, node: NodeId, dirty: &mut HashSet<NodeId>) {
+fn add_following_sibling_subtrees(tree: &DomTree, node: NodeId, dirty: &mut DirtyNodes) {
     let mut sibling = tree.borrow_node(node).and_then(|node| node.next_sibling);
     while let Some(id) = sibling {
         add_style_subtree(tree, id, dirty);
@@ -3524,7 +3556,7 @@ fn add_relational_anchor_scope(
     tree: &DomTree,
     anchor: NodeId,
     reaches: crate::css::InvalidationReaches,
-    dirty: &mut HashSet<NodeId>,
+    dirty: &mut DirtyNodes,
 ) {
     // Re-cascading the anchor subtree covers anchor-self changes, inheritance,
     // and every descendant subject. It is intentionally broader than the
@@ -3543,7 +3575,7 @@ fn add_relational_tree_invalidation(
     tree: &DomTree,
     map: &crate::css::InvalidationMap,
     mutation: &TreeStyleMutation,
-    dirty: &mut HashSet<NodeId>,
+    dirty: &mut DirtyNodes,
 ) -> bool {
     if map.relational_invalidations().is_empty() {
         return true;
@@ -3603,12 +3635,12 @@ fn add_relational_tree_invalidation(
     true
 }
 
-fn add_style_context_chain(tree: &DomTree, node: NodeId, dirty: &mut HashSet<NodeId>) {
+fn add_style_context_chain(tree: &DomTree, node: NodeId, dirty: &mut DirtyNodes) {
     dirty.insert(node);
     dirty.extend(tree.ancestors(node));
 }
 
-fn add_table_row_child_scope(tree: &DomTree, parent: NodeId, dirty: &mut HashSet<NodeId>) {
+fn add_table_row_child_scope(tree: &DomTree, parent: NodeId, dirty: &mut DirtyNodes) {
     let is_table_row = tree.borrow_node(parent).is_some_and(|node| {
         node.as_element()
             .is_some_and(|element| element.local.as_ref() == "tr")
@@ -3647,7 +3679,7 @@ fn add_structural_candidate_scope(
     state: &str,
     candidate: NodeId,
     parent: NodeId,
-    dirty: &mut HashSet<NodeId>,
+    dirty: &mut DirtyNodes,
 ) {
     let invalidations = map
         .structural_invalidations(state)
@@ -3683,7 +3715,7 @@ fn add_inserted_structural_scopes(
     node: NodeId,
     parent: NodeId,
     insertion_count: usize,
-    dirty: &mut HashSet<NodeId>,
+    dirty: &mut DirtyNodes,
     batched_parents: &mut HashSet<NodeId>,
 ) {
     if batched_parents.contains(&parent) {
@@ -3768,7 +3800,7 @@ fn add_removed_structural_scopes(
     map: &crate::css::InvalidationMap,
     removed: NodeId,
     parent: NodeId,
-    dirty: &mut HashSet<NodeId>,
+    dirty: &mut DirtyNodes,
 ) {
     let siblings = element_children(tree, parent);
     if let Some(first) = siblings.first().copied() {
@@ -3819,7 +3851,7 @@ fn add_inserted_sibling_scopes(
     map: &crate::css::InvalidationMap,
     node: NodeId,
     parent: NodeId,
-    dirty: &mut HashSet<NodeId>,
+    dirty: &mut DirtyNodes,
 ) {
     if !map.has_adjacent_sibling_selectors() && !map.has_general_sibling_selectors() {
         return;
@@ -3847,7 +3879,7 @@ fn add_removed_sibling_scopes(
     tree: &DomTree,
     map: &crate::css::InvalidationMap,
     parent: NodeId,
-    dirty: &mut HashSet<NodeId>,
+    dirty: &mut DirtyNodes,
 ) {
     if !map.has_adjacent_sibling_selectors() && !map.has_general_sibling_selectors() {
         return;
@@ -3908,7 +3940,7 @@ fn add_empty_parent_scope(
     map: &crate::css::InvalidationMap,
     parent: NodeId,
     mutations: &[RetainedStyleMutation],
-    dirty: &mut HashSet<NodeId>,
+    dirty: &mut DirtyNodes,
     checked_parents: &mut HashSet<NodeId>,
 ) {
     if !checked_parents.insert(parent) {
@@ -3946,7 +3978,7 @@ fn retained_style_plan(
     sheet: &crate::css::Stylesheet,
     mutations: &[RetainedStyleMutation],
 ) -> RetainedStylePlan {
-    let mut dirty = HashSet::new();
+    let mut dirty = DirtyNodes::default();
     let mut batched_insert_parents = HashSet::new();
     let mut checked_empty_parents = HashSet::new();
     let mut insertion_counts = HashMap::new();
@@ -4567,6 +4599,14 @@ impl NonGeometricStyleCache {
             | "background-origin" | "background-clip" | "color")
     }
 
+    /// Properties no computed-style snapshot holds: the renderer does not
+    /// model transitions or report animation longhands, so the page's own
+    /// fallback answers them whatever the layout. Vue reads all four
+    /// durations and delays before every transition.
+    pub fn never_computed(property: &str) -> bool {
+        property.starts_with("transition") || property.starts_with("animation")
+    }
+
     pub fn new(
         tree: &DomTree,
         viewport: (f32, f32),
@@ -4576,6 +4616,20 @@ impl NonGeometricStyleCache {
         let sources = document_stylesheet_sources(tree, viewport, media_type);
         let sheet = cache.get(&sources, viewport, media_type)?;
         Some(Self::from_sheet(tree, viewport, sheet))
+    }
+
+    /// Like `new`, parsing the document's stylesheets into `cache` when it
+    /// does not hold them. `cache` must not be the one retained layout is
+    /// validated against: a style read must not move that key.
+    pub fn new_parsing(
+        tree: &DomTree,
+        viewport: (f32, f32),
+        media_type: crate::CssMediaType,
+        cache: &mut crate::css::StylesheetCache,
+    ) -> Self {
+        let sources = document_stylesheet_sources(tree, viewport, media_type);
+        let (sheet, _) = cache.get_or_parse(tree, &sources, viewport, media_type);
+        Self::from_sheet(tree, viewport, sheet)
     }
 
     fn from_sheet(tree: &DomTree, viewport: (f32, f32), sheet: std::sync::Arc<crate::css::Stylesheet>) -> Self {
@@ -4922,7 +4976,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
                     }
                     return None;
                 }
-                Some((retained, dirty))
+                Some((retained, dirty.nodes))
             }
             RetainedStylePlan::Full => None,
         }
@@ -17943,7 +17997,7 @@ mod tests {
         else {
             panic!("WAAPI target damage must remain retainable")
         };
-        assert_eq!(dirty, HashSet::from([target]));
+        assert_eq!(dirty.nodes, HashSet::from([target]));
         assert!(has_animation_damage);
     }
 

@@ -99,6 +99,17 @@ impl<'a> ElemName for ObscuraElemName<'a> {
     }
 }
 
+/// html5ever's foreign-attribute table gives SVG's and MathML's `xmlns`
+/// attribute an empty prefix where the DOM has none; kept, it made the name
+/// ":xmlns", which Alpine took for a `:`-binding of the namespace URL and
+/// serialisation wrote out as such.
+fn without_empty_prefix(mut name: QualName) -> QualName {
+    if name.prefix.as_ref().is_some_and(|prefix| prefix.is_empty()) {
+        name.prefix = None;
+    }
+    name
+}
+
 impl TreeSink for DomTree {
     type Handle = NodeId;
     type Output = Self;
@@ -138,7 +149,7 @@ impl TreeSink for DomTree {
         let converted_attrs: Vec<Attribute> = attrs
             .into_iter()
             .map(|a| Attribute {
-                name: a.name,
+                name: without_empty_prefix(a.name),
                 value: a.value.to_string(),
             })
             .collect();
@@ -219,10 +230,11 @@ impl TreeSink for DomTree {
         self.with_node_mut(*target, |node| {
             if let NodeData::Element { attrs: existing, .. } = &mut node.data {
                 for attr in attrs {
-                    let dominated = existing.iter().any(|a| a.name == attr.name);
+                    let name = without_empty_prefix(attr.name);
+                    let dominated = existing.iter().any(|a| a.name == name);
                     if !dominated {
                         existing.push(Attribute {
-                            name: attr.name,
+                            name,
                             value: attr.value.to_string(),
                         });
                     }
@@ -407,6 +419,23 @@ mod tests {
         assert!(tree.len() > 3);
         let text = tree.text_content(tree.document());
         assert!(text.contains("Hello"));
+    }
+
+    #[test]
+    fn svg_namespace_declarations_keep_their_dom_names() {
+        let tree = parse_html(
+            r##"<svg id="s" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><use xlink:href="#a"/></svg>"##,
+        );
+        let svg = tree.get_element_by_id("s").unwrap();
+        let node = tree.get_node(svg).unwrap();
+        let NodeData::Element { attrs, .. } = &node.data else { panic!("svg is an element") };
+        let names: Vec<String> = attrs.iter().map(Attribute::qualified_name).collect();
+        assert_eq!(names, ["id", "xmlns", "xmlns:xlink"]);
+        assert!(attrs[1].name.prefix.is_none());
+        let html = tree.outer_html(svg);
+        assert!(html.contains(r#" xmlns="http://www.w3.org/2000/svg""#), "{html}");
+        assert!(!html.contains(":xmlns="), "{html}");
+        assert!(html.contains(r##"xlink:href="#a""##), "{html}");
     }
 
     #[test]
