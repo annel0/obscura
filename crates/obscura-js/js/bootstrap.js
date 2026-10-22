@@ -8172,7 +8172,7 @@ globalThis.navigator = {
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistration(){return Promise.resolve(undefined);}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
@@ -16396,6 +16396,13 @@ class _Canvas2D {
   createConicGradient() { return { addColorStop(){} }; }
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
+// The 2D context's interface: in browsers its methods sit on
+// CanvasRenderingContext2D.prototype, where canvas fingerprinting and bot
+// detection hook them (detmir.ru wraps prototype.arc in a Proxy, threw on
+// undefined, and the rest of its app setup never ran).
+Object.defineProperty(_Canvas2D, 'name', { value: 'CanvasRenderingContext2D' });
+Object.defineProperty(_Canvas2D.prototype, Symbol.toStringTag, { value: 'CanvasRenderingContext2D', configurable: true });
+globalThis.CanvasRenderingContext2D = _Canvas2D;
 
 class HTMLCanvasElement extends Element {
   get width() {

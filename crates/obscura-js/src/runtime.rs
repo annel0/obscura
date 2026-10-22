@@ -6724,6 +6724,22 @@ mod tests {
     }
 
     #[test]
+    fn canvas_2d_methods_live_on_the_interface_prototype() {
+        let mut rt = setup_runtime("<html><body><canvas id=c width=10 height=10></canvas></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            let calls = 0;
+            const proto = CanvasRenderingContext2D.prototype;
+            proto.arc = new Proxy(proto.arc, { apply(target, self, args) { calls++; return Reflect.apply(target, self, args); } });
+            const ctx = document.getElementById('c').getContext('2d');
+            ctx.beginPath();
+            ctx.arc(5, 5, 2, 0, Math.PI * 2);
+            return [ctx instanceof CanvasRenderingContext2D, Object.prototype.toString.call(ctx),
+                CanvasRenderingContext2D.name, typeof proto.fillText, calls];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, "[object CanvasRenderingContext2D]", "CanvasRenderingContext2D", "function", 1]));
+    }
+
+    #[test]
     fn every_html_element_interface_exists_and_brands_its_tags() {
         let mut rt = setup_runtime(r#"<html><head><base href="/"><title>t</title></head><body>
             <table><tbody><tr><td id=c>1</td></tr></tbody></table><time id=t>now</time><div id=d></div></body></html>"#);
