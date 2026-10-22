@@ -7843,6 +7843,9 @@ Object.defineProperty(globalThis, "origin", {
   enumerable: true,
 });
 
+// on* handler values set on documents and elements, by object.
+const _eventHandlerValues = new WeakMap();
+
 // HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
 // mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
 // event path through these: jQuery checks `("on" + ev) in window`, and React
@@ -7870,7 +7873,23 @@ for (const _ev of [
   if (!(_on in globalThis)) globalThis[_on] = null;
   for (const _proto of [Document.prototype, Element.prototype]) {
     if (!(_on in _proto)) {
-      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
+      // Accessors, as in browsers: a page that freezes Element.prototype
+      // against tampering (sports.ru) made a data property read-only on every
+      // element, so `script.onerror = fn` threw and its ad loader died.
+      Object.defineProperty(_proto, _on, {
+        get() {
+          const handlers = _eventHandlerValues.get(this);
+          return handlers && handlers.has(_on) ? handlers.get(_on) : null;
+        },
+        set(value) {
+          let handlers = _eventHandlerValues.get(this);
+          if (!handlers) _eventHandlerValues.set(this, handlers = new Map());
+          // An EventHandler attribute keeps objects and drops anything else.
+          handlers.set(_on, typeof value === "function" || (typeof value === "object" && value !== null) ? value : null);
+        },
+        configurable: true,
+        enumerable: false,
+      });
     }
   }
 }
@@ -8196,6 +8215,24 @@ globalThis.navigator = {
     estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
     persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
+  },
+  // Chrome's prefixed quota API, still read by ad and anti-fraud scripts
+  // (sports.ru threw on it). Same quota as storage.estimate().
+  webkitTemporaryStorage: {
+    queryUsageAndQuota(success) {
+      if (typeof success === 'function') setTimeout(() => success(0, 5000000000), 0);
+    },
+    requestQuota(size, success) {
+      if (typeof success === 'function') setTimeout(() => success(Math.min(Number(size) || 0, 5000000000)), 0);
+    },
+  },
+  webkitPersistentStorage: {
+    queryUsageAndQuota(success) {
+      if (typeof success === 'function') setTimeout(() => success(0, 0), 0);
+    },
+    requestQuota(size, success) {
+      if (typeof success === 'function') setTimeout(() => success(0), 0);
+    },
   },
 };
 

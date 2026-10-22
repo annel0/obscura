@@ -6709,6 +6709,26 @@ mod tests {
     }
 
     #[test]
+    fn event_handler_properties_survive_a_frozen_element_prototype() {
+        let mut rt = setup_runtime("<html><body><button id=b>go</button></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            'use strict';
+            Object.freeze(Element.prototype);
+            const script = document.createElement('script');
+            script.onerror = () => {};
+            const button = document.getElementById('b');
+            let clicked = 0;
+            button.onclick = () => { clicked++; };
+            button.click();
+            button.onclick = 'not a function';
+            button.click();
+            return [typeof script.onerror, clicked, button.onclick, 'onclick' in button,
+                Object.keys(button).includes('onclick'), document.createElement('div').onload];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["function", 1, null, true, false, null]));
+    }
+
+    #[test]
     fn script_elements_report_the_script_types_they_support() {
         let mut rt = setup_runtime("<html><head><script id=s>1</script></head><body></body></html>");
         let result = rt.evaluate(r#"(function() {
