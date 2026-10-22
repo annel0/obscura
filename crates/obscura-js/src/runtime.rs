@@ -6683,6 +6683,23 @@ mod tests {
     }
 
     #[test]
+    fn navigation_timing_entry_is_listed_like_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const [entry] = performance.getEntriesByType('navigation');
+            const json = entry.toJSON();
+            return [entry.entryType, entry.name === location.href, entry.startTime, entry.type,
+                entry instanceof PerformanceNavigationTiming, entry instanceof PerformanceEntry,
+                performance.getEntries()[0] === entry,
+                performance.getEntriesByName(location.href, 'navigation').length,
+                typeof entry.domContentLoadedEventStart, entry.domContentLoadedEventStart >= 0,
+                typeof json.responseStart, 'detail' in json];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "navigation", true, 0, "navigate", true, true, true, 1, "number", true, "number", false]));
+    }
+
+    #[test]
     fn user_timing_clear_methods_preserve_other_entry_types() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.evaluate(r#"(function() {
@@ -6690,9 +6707,10 @@ mod tests {
             performance.mark('other', {startTime: 2});
             performance.measure('same', {start: 1, end: 3});
             performance.clearMarks('same');
-            const before = performance.getEntries().map(e => e.entryType + ':' + e.name);
+            const timing = () => performance.getEntries().filter(e => e.entryType !== 'navigation');
+            const before = timing().map(e => e.entryType + ':' + e.name);
             performance.clearMeasures();
-            return [before, performance.getEntries().map(e => e.name)];
+            return [before, timing().map(e => e.name)];
         })()"#).unwrap();
         assert_eq!(result, serde_json::json!([["measure:same", "mark:other"], ["other"]]));
     }
@@ -6717,7 +6735,7 @@ mod tests {
                 () => performance.getEntriesByName(),
                 () => new PerformanceEntry(), () => new PerformanceMeasure(),
             ].map(fn => { try { fn(); return 'none'; } catch (error) { return error.name; } });
-            return [errors, performance.getEntries().length];
+            return [errors, performance.getEntries().filter(e => e.entryType !== 'navigation').length];
         })()"#).unwrap();
         assert_eq!(result, serde_json::json!([[
             "TypeError", "TypeError", "SyntaxError", "TypeError", "TypeError", "DataCloneError",

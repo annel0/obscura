@@ -12757,6 +12757,59 @@ globalThis.performance = globalThis.performance || {
       return data.detail;
     }
   };
+  // The document's own navigation entry, which Chrome lists from the first
+  // script on: web-vitals and analytics read their timings off
+  // getEntriesByType('navigation')[0], and threw on an empty list.
+  const navigationTimings = [
+    'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd', 'fetchStart',
+    'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd', 'secureConnectionStart',
+    'requestStart', 'responseStart', 'responseEnd', 'domInteractive', 'domContentLoadedEventStart',
+    'domContentLoadedEventEnd', 'domComplete', 'loadEventStart', 'loadEventEnd',
+  ];
+  // Milliseconds from navigationStart; 0 for what has not happened yet.
+  function sinceNavigation(name) {
+    const timing = perf.timing;
+    const at = timing ? +timing[name] : 0;
+    return at ? Math.max(0, at - (+timing.navigationStart || perf.timeOrigin || 0)) : 0;
+  }
+  globalThis.PerformanceNavigationTiming = class PerformanceNavigationTiming extends PerformanceEntry {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get initiatorType() { state(entryState, this); return 'navigation'; }
+    get nextHopProtocol() { state(entryState, this); return 'http/1.1'; }
+    get type() { state(entryState, this); return 'navigate'; }
+    get redirectCount() { state(entryState, this); return 0; }
+    get workerStart() { state(entryState, this); return 0; }
+    get transferSize() { state(entryState, this); return 0; }
+    get encodedBodySize() { state(entryState, this); return 0; }
+    get decodedBodySize() { state(entryState, this); return 0; }
+    get serverTiming() { state(entryState, this); return []; }
+    toJSON() {
+      const json = super.toJSON();
+      delete json.detail;
+      for (const name of ['initiatorType', 'nextHopProtocol', 'type', 'redirectCount', 'workerStart',
+        'transferSize', 'encodedBodySize', 'decodedBodySize', ...navigationTimings]) json[name] = this[name];
+      return json;
+    }
+  };
+  for (const name of navigationTimings) {
+    Object.defineProperty(PerformanceNavigationTiming.prototype, name, {
+      configurable: true, enumerable: true,
+      get() { state(entryState, this); return sinceNavigation(name); },
+    });
+  }
+  let navigationEntry;
+  function navigationEntries() {
+    if (!navigationEntry) {
+      navigationEntry = Object.create(PerformanceNavigationTiming.prototype);
+      entryState.set(navigationEntry, {
+        get name() { return String(globalThis.location?.href ?? ''); },
+        entryType: 'navigation', startTime: 0,
+        get duration() { return sinceNavigation('loadEventEnd'); },
+        detail: null,
+      });
+    }
+    return [navigationEntry];
+  }
   function queueDelivery() {
     if (deliveryPending) return;
     deliveryPending = true;
@@ -12842,17 +12895,20 @@ globalThis.performance = globalThis.performance || {
   }
   perf.clearMarks = function clearMarks(name = undefined) { checkPerformance(this); clear('mark', name); };
   perf.clearMeasures = function clearMeasures(name = undefined) { checkPerformance(this); clear('measure', name); };
-  perf.getEntries = function getEntries() { checkPerformance(this); return entries(allEntries()); };
+  perf.getEntries = function getEntries() {
+    checkPerformance(this);
+    return entries(navigationEntries().concat(allEntries()));
+  };
   perf.getEntriesByType = function getEntriesByType(type) {
     checkPerformance(this);
     if (!arguments.length) throw new TypeError('An entry type is required');
     type = string(type);
-    return entries(buffers[type] || []);
+    return type === 'navigation' ? navigationEntries() : entries(buffers[type] || []);
   };
   perf.getEntriesByName = function getEntriesByName(name, type = undefined) {
     checkPerformance(this);
     if (!arguments.length) throw new TypeError('An entry name is required');
-    return entries(allEntries(), string(name), type === undefined ? undefined : string(type));
+    return entries(navigationEntries().concat(allEntries()), string(name), type === undefined ? undefined : string(type));
   };
   globalThis.PerformanceObserverEntryList = class PerformanceObserverEntryList {
     constructor() { throw new TypeError('Illegal constructor'); }
