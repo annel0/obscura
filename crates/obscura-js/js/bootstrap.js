@@ -17626,6 +17626,11 @@ if (typeof DOMMatrix === 'undefined') {
     transformPoint(p) { return new DOMPoint(p?.x||0,p?.y||0); }
   };
 }
+// The read-only geometry interfaces, which scripts name for instanceof
+// checks and feature tests (cloudflare.com threw on DOMMatrixReadOnly).
+if (typeof DOMMatrixReadOnly === 'undefined') globalThis.DOMMatrixReadOnly = globalThis.DOMMatrix;
+if (typeof DOMPointReadOnly === 'undefined') globalThis.DOMPointReadOnly = globalThis.DOMPoint;
+if (typeof WebKitCSSMatrix === 'undefined') globalThis.WebKitCSSMatrix = globalThis.DOMMatrix;
 
 if (typeof Image === 'undefined') {
   // In a real browser `new Image()` is `document.createElement('img')`, i.e. a

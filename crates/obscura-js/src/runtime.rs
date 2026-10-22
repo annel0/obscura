@@ -6778,9 +6778,10 @@ mod tests {
                 $('c') instanceof HTMLTableCellElement, $('c') instanceof Element,
                 $('t') instanceof HTMLTimeElement, $('d') instanceof HTMLTimeElement,
                 document.createElement('tr') instanceof HTMLTableRowElement,
-                document instanceof HTMLDocument];
+                document instanceof HTMLDocument, typeof DOMMatrixReadOnly, typeof DOMPointReadOnly];
         })()"#).unwrap();
-        assert_eq!(result, serde_json::json!(["function", "function", "function", true, true, true, true, false, true, true]));
+        assert_eq!(result, serde_json::json!([
+            "function", "function", "function", true, true, true, true, false, true, true, "function", "function"]));
     }
 
     #[test]
