@@ -6246,6 +6246,68 @@ function _throwDocumentDomainSecurityError() {
 }
 
 const _documentInstances = new WeakSet();
+// document.implementation. A global interface with its methods on the
+// prototype, as consent managers (Transcend airgap on webflow.com) patch
+// DOMImplementation.prototype and threw on a missing interface.
+const _documentImplementations = new WeakMap();
+const _implementationOwners = new WeakMap();
+globalThis.DOMImplementation = class DOMImplementation {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  // Spec: createHTMLDocument returns a NEW detached Document. jQuery
+  // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
+  // the result: when we returned `globalThis.document`, the real
+  // `<body>` was wiped, taking every page on the open web that ships
+  // jQuery 3.x with it. Reuse the DOMParser path to build a detached
+  // document, then optionally set the title.
+  createHTMLDocument(title) {
+    const doc = _createDetachedDocument("text/html", false);
+    doc.appendChild(doc.implementation.createDocumentType("html", "", ""));
+    const html = doc.createElement("html");
+    doc.appendChild(html);
+    const head = doc.createElement("head");
+    html.appendChild(head);
+    if (title !== undefined) {
+      const titleEl = doc.createElement("title");
+      titleEl.appendChild(doc.createTextNode(String(title)));
+      head.appendChild(titleEl);
+    }
+    html.appendChild(doc.createElement("body"));
+    return doc;
+  }
+  createDocument(namespace, qualifiedName, doctype) {
+    const ns = namespace == null ? null : String(namespace);
+    const contentType = ns === "http://www.w3.org/1999/xhtml"
+      ? "application/xhtml+xml"
+      : (ns === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
+    const doc = _createDetachedDocument(contentType, true);
+    const name = qualifiedName == null ? "" : String(qualifiedName);
+    const element = name === "" ? null : doc.createElementNS(ns, name);
+    if (doctype != null) doc.appendChild(doctype);
+    if (element) doc.appendChild(element);
+    return doc;
+  }
+  // createDocumentType(qualifiedName, publicId, systemId): build a detached
+  // DocumentType node. Browsers validate leniently here (only a name with
+  // ASCII whitespace or ">" is rejected, matching the WPT cases); the node's
+  // owner document is the document whose implementation was used.
+  createDocumentType(qualifiedName, publicId, systemId) {
+    const name = String(qualifiedName);
+    if (name === "" || /[\t\n\f\r >]/.test(name)) {
+      throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
+    }
+    const dt = new DocumentType(
+      +_dom("create_doctype", name, publicId === undefined ? "" : String(publicId)),
+      name,
+      publicId === undefined ? "" : String(publicId),
+      systemId === undefined ? "" : String(systemId)
+    );
+    _seedDetachedTreeState(dt);
+    _cache.set(dt._nid, dt);
+    return _stampNodeDocument(dt, _implementationOwners.get(this));
+  }
+  hasFeature() { return true; }
+};
+
 class Document extends Node {
   constructor(nid) {
     super(nid);
@@ -6803,63 +6865,15 @@ class Document extends Node {
   // (issue #468). Standards mode, so documentElement; quirks mode would be
   // body, but we never parse in quirks mode.
   get scrollingElement() { return this.documentElement; }
+  // One DOMImplementation per document, as in browsers.
   get implementation() {
-    const ownerDoc = this;
-    return {
-      // Spec: createHTMLDocument returns a NEW detached Document. jQuery
-      // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
-      // the result: when we returned `globalThis.document`, the real
-      // `<body>` was wiped, taking every page on the open web that ships
-      // jQuery 3.x with it. Reuse the DOMParser path to build a detached
-      // document, then optionally set the title.
-      createHTMLDocument(title) {
-        const doc = _createDetachedDocument("text/html", false);
-        doc.appendChild(doc.implementation.createDocumentType("html", "", ""));
-        const html = doc.createElement("html");
-        doc.appendChild(html);
-        const head = doc.createElement("head");
-        html.appendChild(head);
-        if (title !== undefined) {
-          const titleEl = doc.createElement("title");
-          titleEl.appendChild(doc.createTextNode(String(title)));
-          head.appendChild(titleEl);
-        }
-        html.appendChild(doc.createElement("body"));
-        return doc;
-      },
-      createDocument(namespace, qualifiedName, doctype) {
-        const ns = namespace == null ? null : String(namespace);
-        const contentType = ns === "http://www.w3.org/1999/xhtml"
-          ? "application/xhtml+xml"
-          : (ns === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
-        const doc = _createDetachedDocument(contentType, true);
-        const name = qualifiedName == null ? "" : String(qualifiedName);
-        const element = name === "" ? null : doc.createElementNS(ns, name);
-        if (doctype != null) doc.appendChild(doctype);
-        if (element) doc.appendChild(element);
-        return doc;
-      },
-      // createDocumentType(qualifiedName, publicId, systemId): build a detached
-      // DocumentType node. Browsers validate leniently here (only a name with
-      // ASCII whitespace or ">" is rejected, matching the WPT cases); the node's
-      // owner document is the document whose implementation was used.
-      createDocumentType(qualifiedName, publicId, systemId) {
-        const name = String(qualifiedName);
-        if (name === "" || /[\t\n\f\r >]/.test(name)) {
-          throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
-        }
-        const dt = new DocumentType(
-          +_dom("create_doctype", name, publicId === undefined ? "" : String(publicId)),
-          name,
-          publicId === undefined ? "" : String(publicId),
-          systemId === undefined ? "" : String(systemId)
-        );
-        _seedDetachedTreeState(dt);
-        _cache.set(dt._nid, dt);
-        return _stampNodeDocument(dt, ownerDoc);
-      },
-      hasFeature() { return true; },
-    };
+    let implementation = _documentImplementations.get(this);
+    if (!implementation) {
+      implementation = Object.create(DOMImplementation.prototype);
+      _implementationOwners.set(implementation, this);
+      _documentImplementations.set(this, implementation);
+    }
+    return implementation;
   }
   get styleSheets() {
     if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
@@ -14352,12 +14366,32 @@ globalThis.HTMLDetailsElement = Element;
   Object.defineProperty(HTMLTextAreaElement.prototype, 'value', valueDescriptor);
   // <li> already reflects its integer value.
   delete Element.prototype.value;
+  // Interfaces that were missing altogether: a script naming one threw a
+  // ReferenceError (webflow.com's consent manager on HTMLBaseElement).
+  for (const name of ['HTMLAreaElement', 'HTMLBaseElement', 'HTMLDirectoryElement', 'HTMLDListElement',
+    'HTMLEmbedElement', 'HTMLFontElement', 'HTMLFrameElement', 'HTMLFrameSetElement', 'HTMLMapElement',
+    'HTMLMarqueeElement', 'HTMLMenuElement', 'HTMLModElement', 'HTMLObjectElement', 'HTMLOptGroupElement',
+    'HTMLParamElement', 'HTMLPictureElement', 'HTMLQuoteElement', 'HTMLSourceElement',
+    'HTMLTableCaptionElement', 'HTMLTableCellElement', 'HTMLTableColElement', 'HTMLTableRowElement',
+    'HTMLTableSectionElement', 'HTMLTimeElement', 'HTMLTitleElement']) {
+    if (typeof globalThis[name] === 'undefined') globalThis[name] = { [name]: class extends Element {} }[name];
+  }
+  if (typeof globalThis.HTMLDocument === 'undefined') globalThis.HTMLDocument = Document;
 }
-// Tag names whose elements carry `value` through the brands above.
+// HTML tag names whose elements are instances of their own interface above.
 var _valueElementClasses = {
   BUTTON: 'HTMLButtonElement', SELECT: 'HTMLSelectElement', OPTION: 'HTMLOptionElement',
   PROGRESS: 'HTMLProgressElement', METER: 'HTMLMeterElement', OUTPUT: 'HTMLOutputElement',
-  DATA: 'HTMLDataElement',
+  DATA: 'HTMLDataElement', AREA: 'HTMLAreaElement', BASE: 'HTMLBaseElement', DIR: 'HTMLDirectoryElement',
+  DL: 'HTMLDListElement', EMBED: 'HTMLEmbedElement', FONT: 'HTMLFontElement', FRAME: 'HTMLFrameElement',
+  FRAMESET: 'HTMLFrameSetElement', MAP: 'HTMLMapElement', MARQUEE: 'HTMLMarqueeElement',
+  MENU: 'HTMLMenuElement', DEL: 'HTMLModElement', INS: 'HTMLModElement', OBJECT: 'HTMLObjectElement',
+  OPTGROUP: 'HTMLOptGroupElement', PARAM: 'HTMLParamElement', PICTURE: 'HTMLPictureElement',
+  Q: 'HTMLQuoteElement', BLOCKQUOTE: 'HTMLQuoteElement', SOURCE: 'HTMLSourceElement',
+  CAPTION: 'HTMLTableCaptionElement', TD: 'HTMLTableCellElement', TH: 'HTMLTableCellElement',
+  COL: 'HTMLTableColElement', COLGROUP: 'HTMLTableColElement', TR: 'HTMLTableRowElement',
+  THEAD: 'HTMLTableSectionElement', TBODY: 'HTMLTableSectionElement', TFOOT: 'HTMLTableSectionElement',
+  TIME: 'HTMLTimeElement', TITLE: 'HTMLTitleElement',
 };
 globalThis.HTMLDialogElement = Element;
 // SVGAnimatedString backs the className and href reflections on SVG elements.
@@ -17528,6 +17562,7 @@ if (typeof DOMRect === 'undefined') {
     static fromRect(r={}) { return new DOMRect(r.x,r.y,r.width,r.height); }
   };
 }
+if (typeof DOMRectReadOnly === 'undefined') globalThis.DOMRectReadOnly = globalThis.DOMRect;
 
 if (typeof DOMRectList === 'undefined') {
   globalThis.DOMRectList = class DOMRectList {

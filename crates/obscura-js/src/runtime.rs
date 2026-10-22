@@ -6709,6 +6709,38 @@ mod tests {
     }
 
     #[test]
+    fn every_html_element_interface_exists_and_brands_its_tags() {
+        let mut rt = setup_runtime(r#"<html><head><base href="/"><title>t</title></head><body>
+            <table><tbody><tr><td id=c>1</td></tr></tbody></table><time id=t>now</time><div id=d></div></body></html>"#);
+        let result = rt.evaluate(r#"(function() {
+            const $ = id => document.getElementById(id);
+            return [typeof HTMLBaseElement, typeof HTMLTableCellElement, typeof HTMLDocument,
+                document.querySelector('base') instanceof HTMLBaseElement,
+                $('c') instanceof HTMLTableCellElement, $('c') instanceof Element,
+                $('t') instanceof HTMLTimeElement, $('d') instanceof HTMLTimeElement,
+                document.createElement('tr') instanceof HTMLTableRowElement,
+                document instanceof HTMLDocument];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["function", "function", "function", true, true, true, true, false, true, true]));
+    }
+
+    #[test]
+    fn dom_implementation_is_one_global_interface_per_document() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const implementation = document.implementation;
+            const detached = implementation.createHTMLDocument('t');
+            const doctype = implementation.createDocumentType('html', '', '');
+            return [typeof DOMImplementation, implementation instanceof DOMImplementation,
+                implementation === document.implementation,
+                typeof DOMImplementation.prototype.createHTMLDocument,
+                detached.title, detached.implementation !== implementation,
+                doctype.ownerDocument === document, (() => { try { new DOMImplementation(); return 'made'; } catch (e) { return e.name; } })()];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["function", true, true, "function", "t", true, true, "TypeError"]));
+    }
+
+    #[test]
     fn only_value_bearing_elements_have_a_value() {
         let mut rt = setup_runtime(r#"<html><body><div id=d></div>
             <select id=s><option value=a>A</option><option value=b selected>B</option></select>
